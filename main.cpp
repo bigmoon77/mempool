@@ -44,47 +44,56 @@ int main() {
 
 
 
-    std::cout << "==== create pool ====\n";
-    unitype_pool<test_obj, 16> pool;
-
-    std::cout << "\n==== single construct ====\n";
-    auto p1 = pool.construct(10);
-    std::cout << "value: " << p1->value << "\n";
-    std::cout << "use_count: " << p1.get_use_count() << "\n";
-
-    std::cout << "\n==== copy proxy ====\n";
     {
-        auto p2 = p1;
-        std::cout << "use_count after copy: " << p1.get_use_count() << "\n";
+        std::cout << "==== create pool ====\n";
+        unitype_pool<test_obj, 16> pool;
+        {
+            std::cout << "\n==== single construct ====\n";
+            auto p1 = pool.construct(10);
+            std::cout << "value: " << p1->value << "\n";
+            std::cout << "use_count: " << p1.get_use_count() << "\n";
+
+            std::cout << "\n==== copy proxy ====\n";
+            {
+                auto p2 = p1;
+                std::cout << "use_count after copy: " << p1.get_use_count() << "\n";
+            }
+            std::cout << "use_count after scope exit: " << p1.get_use_count() << "\n";
+
+            std::cout << "\n==== array construct ====\n";
+
+            auto arr = pool.construct(3, 5); // value=5, num=3
+
+            for (size_t i = 0; i < arr.get_size(); ++i) {
+                std::cout << arr[i].value << " ";
+            }
+            std::cout << "\n";
+
+            std::cout << "\n==== destruct test ====\n";
+            pool.destruct(p1);
+
+            std::cout << "\n==== gc test ====\n";
+            pool.gc();
+
+            std::cout << "\n==== create more objects ====\n";
+
+            auto p3 = pool.construct(12);
+            auto p4 = pool.construct(16);
+
+
+            std::cout << "p3: " << p3->value << "\n";
+            std::cout << "p4: " << p4->value << "\n";
+
+            std::cout << "\n==== force fragmentation ====\n";
+
+            pool.destruct(p3);
+            pool.gc();
+
+            std::cout << "\n==== mem efficiency check ====\n";
+
+        }
+        pool.gc();
     }
-    std::cout << "use_count after scope exit: " << p1.get_use_count() << "\n";
-
-    std::cout << "\n==== array construct ====\n";
-    auto arr = pool.construct(3, 5); // value=5, num=3
-    for (size_t i = 0; i < arr.get_size(); ++i) {
-        std::cout << arr[i].value << " ";
-    }
-    std::cout << "\n";
-
-    std::cout << "\n==== destruct test ====\n";
-    pool.destruct(p1);
-
-    std::cout << "\n==== gc test ====\n";
-    pool.gc();
-
-    std::cout << "\n==== create more objects ====\n";
-    auto p3 = pool.construct(42);
-    auto p4 = pool.construct(100);
-
-    std::cout << "p3: " << p3->value << "\n";
-    std::cout << "p4: " << p4->value << "\n";
-
-    std::cout << "\n==== force fragmentation ====\n";
-    pool.destruct(p3);
-    pool.gc();
-
-    std::cout << "\n==== mem efficiency check ====\n";
-    pool.gc();
 
     std::cout << "\n==== end ====\n";
 
@@ -100,7 +109,6 @@ int main() {
 
         for (size_t i = 0; i < 5; ++i)
             p[i] = static_cast<int>(i * 10);
-        std::cout << " => ";
 
         for (size_t i = 0; i < 5; ++i)
             std::cout << p[i] << " ";

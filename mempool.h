@@ -113,7 +113,7 @@ private:
 			proxy_ptr& operator = (const proxy_ptr& other) {
 				//参照するポインタの代入　poolでのリークに注意
 			
-				if (_ptr &&_mtx) {
+				if (_ptr) {
 					std::lock_guard lock(*_mtx);
 					--_ptr->ref_count;
 				}
@@ -286,8 +286,8 @@ private:
 
 		void gc(std::mutex& mtx) {
 
-			//未使用な領域がない為不要
-			if (back_ind == inst_count) return;
+			//未使用な領域がない為不要 reference countの実装に伴い不具合の元となるので削除
+			//if (back_ind == inst_count) return;
 
 
 			{
@@ -295,7 +295,7 @@ private:
 				for (size_t i = 0; i < max_count; i++)
 				{
 					if (infos[i].ptr && infos[i].ref_count == 0) {
-						--inst_count;
+						inst_count -= infos[i].num;
 
 						infos[i].ptr->~value_type();
 
