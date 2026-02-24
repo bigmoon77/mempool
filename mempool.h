@@ -2,7 +2,7 @@
 
 #include <located_exception.h>
 #include <list>
-
+#include <mutex>
 
 template<typename t, size_t pool_size>
 class unitype_pool {
@@ -10,13 +10,13 @@ class unitype_pool {
 public:
 	using value_type = t;
 private:
-
 	struct chunk {
 
 #pragma region データ構造
 		struct info {
 			value_type* ptr = nullptr;
 			size_t num = 0;
+			size_t ref_count = 0;
 
 			bool operator == (const info& other) const {
 				return ptr == other.ptr;
@@ -29,14 +29,32 @@ private:
 
 		class proxy_ptr {
 			info* _ptr = nullptr;
+			std::mutex* _mtx = nullptr;
 		public:
 			proxy_ptr() = default;
-			proxy_ptr(info& ref) : _ptr(&ref) {
+
+			/// <summary>
+			/// この初期化の場合は呼び出し側が参照カウントを初期化する
+			/// </summary>
+			/// <param name="ref"></param>
+			/// <param name="mtx"></param>
+			proxy_ptr(info& ref,std::mutex& mtx) : _ptr(&ref),_mtx(&mtx) {
+
 			}
-			proxy_ptr(const proxy_ptr& other) :_ptr(other._ptr) {
+			proxy_ptr(const proxy_ptr& other) :_ptr(other._ptr),_mtx(other._mtx) {
+				if (_ptr) {
+					std::lock_guard lock(*_mtx);
+					++_ptr->ref_count;
+				}
 			}
 
-			~proxy_ptr() = default;
+			~proxy_ptr() {
+				if (_ptr) {
+					std::lock_guard lock(*_mtx);
+					--_ptr->ref_count;
+				}
+			
+			};
 
 			value_type* operator -> () {
 #ifdef _DEBUG
@@ -94,8 +112,34 @@ private:
 
 			proxy_ptr& operator = (const proxy_ptr& other) {
 				//参照するポインタの代入　poolでのリークに注意
-				_ptr = other._ptr;
+			
+				if (_ptr &&_mtx) {
+					std::lock_guard lock(*_mtx);
+					--_ptr->ref_count;
+				}
+
+				if (other._mtx) {
+					std::lock_guard lock(*other._mtx);
+					_mtx = other._mtx;
+					_ptr = other._ptr;
+					++_ptr->ref_count;
+				}
+				else {
+					_mtx = nullptr;
+					_ptr = nullptr;
+				}
+
 				return *this;
+			}
+
+			size_t get_use_count()const {
+#ifdef _DEBUG
+				if (!_ptr || !_mtx) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+				std::lock_guard lock(*_mtx);
+				return _ptr->ref_count;
 			}
 
 			const size_t& get_size() const {
@@ -121,7 +165,7 @@ private:
 		//使用者はこの配列要素のptrを参照し、メモリの移動に対応する
 		info infos[max_count] = {};
 
-
+		
 
 		chunk() = default;
 
@@ -135,7 +179,6 @@ private:
 						infos[i].ptr[j].~value_type();
 					}
 
-
 					std::cerr << "memory leak " << infos[i].ptr << "[" << infos[i].num << "]" << std::endl;
 				}
 			}
@@ -145,7 +188,7 @@ private:
 
 
 		template<typename... types>
-		proxy_ptr construct(types&& ... args, const size_t& num = 1) {
+		proxy_ptr construct(const size_t& num, std::mutex& mtx,types&& ... args) {
 
 			auto new_ind = back_ind + num;
 			if (new_ind > max_count) {
@@ -169,44 +212,12 @@ private:
 				if (!infos[i].ptr) {
 					infos[i].ptr = res;
 					infos[i].num = num;
+					infos[i].ref_count = 1;
 					break;
 				}
 			}
 
-			return proxy_ptr(infos[i]);
-		}
-
-		void destruct(value_type* ptr, const size_t& num = 1) {
-#ifdef _DEBUG
-			if (!(is_contains(ptr) && is_contains(ptr + (num - 1)))) {
-				throw error::located_exception("bad ptr");
-			}
-#endif // _DEBUG
-			for (size_t i = 0; i < num; i++)
-			{
-				ptr[i].~value_type();
-			}
-
-			if (is_back(&ptr[num - 1])) {
-#ifdef _DEBUG
-				if (back_ind < num) {
-					throw error::located_exception("bad dealloc num");
-				}
-#endif // _DEBUG
-				back_ind -= num;
-			}
-
-			inst_count -= num;
-
-			//find ptr
-			for (size_t i = 0; i < max_count; i++)
-			{
-				if (infos[i].ptr == ptr) {
-					infos[i].ptr = nullptr;
-					infos[i].num = 0;
-					break;
-				}
-			}
+			return proxy_ptr(infos[i],mtx);
 		}
 
 		void destruct(proxy_ptr& ptr) {
@@ -215,6 +226,14 @@ private:
 				throw error::located_exception("bad ptr");
 			}
 #endif // _DEBUG
+
+#ifdef _DEBUG
+			if (ptr.get_use_count() != 1) {
+				throw error::located_exception("参照されているオブジェクトの破棄");
+			}
+#endif
+
+			//オブジェクトの破棄
 			for (size_t i = 0; i < ptr.get_size(); i++)
 			{
 				ptr[i].~value_type();
@@ -231,12 +250,14 @@ private:
 
 			inst_count -= ptr.get_size();
 
+
 			//find ptr
 			for (size_t i = 0; i < max_count; i++)
 			{
 				if (infos[i].ptr == ptr.get()) {
 					infos[i].ptr = nullptr;
 					infos[i].num = 0;
+					infos[i].ref_count = 0;
 					break;
 				}
 			}
@@ -263,10 +284,26 @@ private:
 		}
 
 
-		void gc() {
+		void gc(std::mutex& mtx) {
 
 			//未使用な領域がない為不要
 			if (back_ind == inst_count) return;
+
+
+			{
+				std::lock_guard lock(mtx);
+				for (size_t i = 0; i < max_count; i++)
+				{
+					if (infos[i].ptr && infos[i].ref_count == 0) {
+						--inst_count;
+
+						infos[i].ptr->~value_type();
+
+						infos[i].ptr = nullptr;
+						infos[i].num = 0;
+					}
+				}
+			}
 
 
 			std::unique_ptr<info[]> tmp(new info[max_count]);
@@ -278,6 +315,8 @@ private:
 			size_t offset = 0;
 
 			auto arr = tmp.get();
+
+
 			for (size_t i = 0; i < max_count; i++)
 			{
 				if (arr[i].ptr) {
@@ -336,10 +375,10 @@ private:
 	};
 
 	std::list<chunk> _chunks;
-
+	std::mutex _mtx;
 public:
 	template<typename ... types>
-	auto construct(types&&... args, const size_t& num = 1) {
+	auto construct(const size_t& num , types&&... args) {
 		if (_chunks.empty()) {
 			_chunks.emplace_back();
 		}
@@ -348,12 +387,12 @@ public:
 		for (auto& i : _chunks)
 		{
 			if (i.constructable(num)) {
-				return i.construct(std::forward<types>(args)..., num);
+				return i. construct(num, _mtx,std::forward<types>(args)...);
 			}
 			else {
-				i.gc();
+				i.gc(_mtx);
 				if (i.constructable(num)) {
-					return i.construct(std::forward<types>(args)..., num);
+					return i. construct(num, _mtx,std::forward<types>(args)...);
 				}
 			}
 		}
@@ -362,11 +401,11 @@ public:
 		auto& back = _chunks.back();
 
 #ifdef _DEBUG
-		if (back.constructable(num)) {
+		if (!back.constructable(num)) {
 			throw error::located_exception("プールより大きなオブジェクトの確保");
 		}
 #endif 
-		return back.construct(std::forward<types>(args)..., num);
+		return back. construct(num, _mtx,std::forward<types>(args)...);
 	}
 
 	void destruct(chunk::proxy_ptr& ptr) {
@@ -384,7 +423,7 @@ public:
 	void gc() {
 		for (auto& i : _chunks)
 		{
-			i.gc();
+			i.gc(_mtx);
 		}
 	}
 };
@@ -403,6 +442,7 @@ public:
 			void* ptr = nullptr;
 			size_t num = 0;
 			size_t tsize = 0;
+			size_t ref_count = 0;
 			void (*destruct)(void*, size_t) = nullptr;
 			void (*move)(void*, void*, size_t) = nullptr;
 
@@ -420,11 +460,18 @@ public:
 			using value_type = t;
 		private:
 			info* _ptr = nullptr;
+			std::mutex* _mtx = nullptr;
 		public:
 			proxy_ptr() = default;
-			proxy_ptr(info& a) :_ptr(&a) {};
-			proxy_ptr(const proxy_ptr& other) : _ptr(other._ptr) {};
-			~proxy_ptr() = default;
+			proxy_ptr(info& a, std::mutex& mtx) :_ptr(&a), _mtx(&mtx) {};
+			proxy_ptr(const proxy_ptr& other) : _ptr(other._ptr),_mtx(other._mtx) {};
+			~proxy_ptr() {
+				if (_ptr) {
+					std::lock_guard lock(*_mtx);
+					--_ptr->ref_count;
+				}
+			
+			};
 
 			value_type* operator ->() {
 #ifdef _DEBUG
@@ -501,6 +548,15 @@ public:
 				return (value_type*)_ptr->ptr;
 			}
 
+			size_t get_use_count()const {
+#ifdef _DEBUG
+				if (!_ptr || !_mtx) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+				std::lock_guard lock(*_mtx);
+				return _ptr->ref_count;
+			}
 
 			const size_t& get_size()const {
 #ifdef _DEBUG
@@ -512,9 +568,25 @@ public:
 			}
 
 
+
 			proxy_ptr& operator = (const proxy_ptr& other) {
-				_ptr = other._ptr;
+
+				if (_mtx) {
+					std::lock_guard lock(*_mtx);
+					--_ptr->ref_count;
+				}
+
+				if (other._mtx) {
+					std::lock_guard lock(*other._mtx);
+					_mtx = other._mtx;
+					_ptr = other._ptr;
+				}
+
 				return *this;
+			}
+
+			operator bool()const {
+				return _ptr && _ptr->ptr;
 			}
 		};
 
@@ -529,6 +601,7 @@ public:
 
 
 		~chunk() {
+			
 			for (auto& i : infos)
 			{
 				std::cerr << "memory leak " << i.ptr << "[" << i.num << "]" << std::endl;
@@ -539,7 +612,7 @@ public:
 
 
 		template<typename t, typename... types>
-		proxy_ptr<t> construct(types&&... args, const size_t& num) {
+		proxy_ptr<t> construct(const size_t& num, std::mutex& mtx, types&&... args) {
 
 			auto new_ind = back_ind + (num * sizeof(t));
 			if (new_ind > max_byte) {
@@ -555,23 +628,17 @@ public:
 			back_ind = new_ind;
 
 			info tmp;
-			if constexpr (std::is_trivially_copyable_v<t>) {
-
-				tmp.ptr = ptr;
-				tmp.num = num;
-				tmp.tsize = sizeof(t);
-
-			}
-			else {
-
-				tmp.ptr = ptr;
-				tmp.num = num;
-				tmp.tsize = sizeof(t);
+			if constexpr (!std::is_trivially_copyable_v<t>) {
 				tmp.destruct = &destruct_obj<t>;
 				tmp.move = &move_obj<t>;
 			}
 
-			return proxy_ptr<t>(infos.emplace_back(tmp));
+			tmp.ptr = ptr;
+			tmp.num = num;
+			tmp.tsize = sizeof(t);
+			tmp.ref_count = 1;
+
+			return proxy_ptr<t>(infos.emplace_back(tmp), mtx);
 
 		}
 
@@ -585,17 +652,30 @@ public:
 				throw error::located_exception("プールに含まれないオブジェクトの破棄");
 			}
 
+
+			if (ptr.get_use_count() != 1) {
+				throw error::located_exception("参照されているオブジェクトの破棄");
+			}
+
 			if (itr->destruct) {
 				itr->destruct(itr->ptr, itr->num);
 			}//そうでない場合はトリビアル型なので破棄不要
+			
 
 			infos.erase(itr);
 		}
 
-		void gc() {
+		void gc(std::mutex& mtx) {
+
+			{
+				std::lock_guard lock(mtx);
+				
+				std::erase_if(infos, [](const info& i) {
+					return i.ref_count == 0;
+					});
+			}
 
 			size_t offset = 0;
-
 			infos.sort();
 
 			//アドレス昇順
@@ -677,11 +757,11 @@ public:
 
 private:
 	std::list<chunk_type> _chunks;
-
+	std::mutex _mtx;
 public:
 
 	template<typename t,typename ... types>
-	auto construct(types&& ... args,const size_t& num) {
+	auto construct(const size_t& num = 1,types&& ... args) {
 		
 		if(_chunks.empty())
 			_chunks.emplace_back();
@@ -690,12 +770,13 @@ public:
 		for (auto& i : _chunks)
 		{
 			if (i.constructable(sizeof(t), num)) {
-				return i.construct<t,types...>(std::forward<types>(args)...,num);
+				return i.template construct<t, types...>(num, _mtx,std::forward<types>(args)...);
 			}
 			else {
-				i.gc();
+
+				i.gc(_mtx);
 				if (i.constructable(sizeof(t), num)) {
-					return i.construct<t,types...>(std::forward<types>(args)...,num);
+					return i.template construct<t, types...>(num, _mtx,std::forward<types>(args)...);
 				}
 			}
 		}
@@ -703,11 +784,14 @@ public:
 		_chunks.emplace_back();
 		auto& back = _chunks.back();
 
-		if (back.constructable(sizeof(t), num)) {
-			return back.construct<t>(num);
-		}
+#ifdef _DEBUG
+		if (!back.constructable(sizeof(t), num)) {
 
-		throw error::located_exception("プールより大きなオブジェクトの確保");
+			throw error::located_exception("プールより大きなオブジェクトの確保");
+		}
+#endif
+
+		return back.template construct<t, types...>(num, _mtx, std::forward<types>(args)...);
 
 	}
 
@@ -729,7 +813,7 @@ public:
 
 		for (auto& i :_chunks)
 		{
-			i.gc();
+			i.gc(_mtx);
 		}
 	}
 };
