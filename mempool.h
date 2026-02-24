@@ -389,3 +389,347 @@ public:
 	}
 };
 
+
+
+template<size_t chunk_size>
+class anytype_pool {
+
+public:
+	template<size_t pool_size>
+	struct chunk {
+		static inline constexpr size_t max_byte = pool_size;
+
+		struct info {
+			void* ptr = nullptr;
+			size_t num = 0;
+			size_t tsize = 0;
+			void (*destruct)(void*, size_t) = nullptr;
+			void (*move)(void*, void*, size_t) = nullptr;
+
+			bool operator == (const info& other)const {
+				return ptr == other.ptr;
+			}
+			bool operator < (const info& other)const {
+				return ptr < other.ptr;
+			}
+		};
+
+		template<typename t>
+		class proxy_ptr {
+		public:
+			using value_type = t;
+		private:
+			info* _ptr = nullptr;
+		public:
+			proxy_ptr() = default;
+			proxy_ptr(info& a) :_ptr(&a) {};
+			proxy_ptr(const proxy_ptr& other) : _ptr(other._ptr) {};
+			~proxy_ptr() = default;
+
+			value_type* operator ->() {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+
+				return (value_type*)_ptr->ptr;
+			}
+			const value_type* operator ->() const {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+				return (value_type*)_ptr->ptr;
+			}
+
+
+			value_type& operator *() {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+
+				return *(value_type*)_ptr->ptr;
+			}
+			const value_type& operator *() const {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+				return *(value_type*)_ptr->ptr;
+			}
+
+
+			value_type& operator [](size_t ind) {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+
+				return ((value_type*)_ptr->ptr)[ind];
+			}
+			const value_type& operator [](size_t ind) const {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+				return ((value_type*)_ptr->ptr)[ind];
+			}
+
+
+			value_type* get() {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+
+				return (value_type*)_ptr->ptr;
+			}
+			const value_type* get() const {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+				return (value_type*)_ptr->ptr;
+			}
+
+
+			const size_t& get_size()const {
+#ifdef _DEBUG
+				if (!_ptr) {
+					throw error::located_exception("nullptr");
+				}
+#endif
+				return _ptr->num;
+			}
+
+
+			proxy_ptr& operator = (const proxy_ptr& other) {
+				_ptr = other._ptr;
+				return *this;
+			}
+		};
+
+
+
+		std::uint8_t data[max_byte];
+
+		//アドレス昇順
+		std::list<info> infos;
+
+		size_t back_ind = 0;
+
+
+		~chunk() {
+			for (auto& i : infos)
+			{
+				std::cerr << "memory leak " << i.ptr << "[" << i.num << "]" << std::endl;
+				if (i.destruct)
+					i.destruct(i.ptr, i.num);
+			}
+		}
+
+
+		template<typename t, typename... types>
+		proxy_ptr<t> construct(types&&... args, const size_t& num) {
+
+			auto new_ind = back_ind + (num * sizeof(t));
+			if (new_ind > max_byte) {
+				return {};
+			}
+
+			auto ptr = (t*)&data[back_ind];
+			for (size_t i = 0; i < num; i++)
+			{
+				new (&ptr[i]) t(std::forward<types>(args)...);
+			}
+
+			back_ind = new_ind;
+
+			info tmp;
+			if constexpr (std::is_trivially_copyable_v<t>) {
+
+				tmp.ptr = ptr;
+				tmp.num = num;
+				tmp.tsize = sizeof(t);
+
+			}
+			else {
+
+				tmp.ptr = ptr;
+				tmp.num = num;
+				tmp.tsize = sizeof(t);
+				tmp.destruct = &destruct_obj<t>;
+				tmp.move = &move_obj<t>;
+			}
+
+			return proxy_ptr<t>(infos.emplace_back(tmp));
+
+		}
+
+		template<typename t>
+		void destruct(proxy_ptr<t>& ptr) {
+			info tmp;
+			tmp.ptr = ptr.get();
+
+			auto itr = std::find(infos.begin(), infos.end(), tmp);
+			if (itr == infos.end()) {
+				throw error::located_exception("プールに含まれないオブジェクトの破棄");
+			}
+
+			if (itr->destruct) {
+				itr->destruct(itr->ptr, itr->num);
+			}//そうでない場合はトリビアル型なので破棄不要
+
+			infos.erase(itr);
+		}
+
+		void gc() {
+
+			size_t offset = 0;
+
+			infos.sort();
+
+			//アドレス昇順
+			for (auto& i : infos)
+			{
+				if (i.move) {
+					i.move(&data[offset], i.ptr, i.num);
+					i.ptr = &data[offset];
+				}
+				else if (&data[offset] != i.ptr) {
+					std::memmove(&data[offset], i.ptr, i.tsize * i.num);
+					i.ptr = &data[offset];
+				}
+
+				offset += i.tsize * i.num;
+			}
+
+			back_ind = offset;
+		}
+
+
+		bool constructable(const size_t& byte, const size_t& num) {
+			return back_ind + (num * byte) <= max_byte;
+		}
+
+		bool is_contains(void* block) const {
+			return data <= block && block <= &data[max_byte];
+		}
+
+		template<typename t>
+		static void destruct_obj(void* block, size_t num) {
+			for (size_t i = 0; i < num; i++)
+			{
+				((t*)block)[i].~t();
+			}
+		}
+		template<typename t>
+		static void move_obj(void* dest, void* src, size_t num) {
+			if (dest == src) return;
+
+			auto to = (t*)dest;
+			auto from = (t*)src;
+
+			if (from - to < sizeof(t)) {
+
+#ifdef _DEBUG
+				if (from - to < 0)
+					throw error::located_exception("fatal error moveするアドレスの反転");
+#endif 
+
+				//詰める領域が被っている場合、一時バッファを仲介する
+				for (size_t i = 0; i < num; i++)
+				{
+					t tmp(std::move(from[i]));
+
+					from[i].~t();
+
+					new (&to[i]) t(std::move(tmp));
+				}
+			}
+			else {
+
+				for (size_t i = 0; i < num; i++)
+				{
+					new (&to[i]) t(std::move(from[i]));
+
+					from[i].~t();
+				}
+			}
+
+		}
+	};
+
+
+	using chunk_type = typename chunk<chunk_size>;
+	
+	template<typename t>
+	using ptr_type = typename chunk_type::template proxy_ptr <t>;
+
+private:
+	std::list<chunk_type> _chunks;
+
+public:
+
+	template<typename t,typename ... types>
+	auto construct(types&& ... args,const size_t& num) {
+		
+		if(_chunks.empty())
+			_chunks.emplace_back();
+
+
+		for (auto& i : _chunks)
+		{
+			if (i.constructable(sizeof(t), num)) {
+				return i.construct<t,types...>(std::forward<types>(args)...,num);
+			}
+			else {
+				i.gc();
+				if (i.constructable(sizeof(t), num)) {
+					return i.construct<t,types...>(std::forward<types>(args)...,num);
+				}
+			}
+		}
+
+		_chunks.emplace_back();
+		auto& back = _chunks.back();
+
+		if (back.constructable(sizeof(t), num)) {
+			return back.construct<t>(num);
+		}
+
+		throw error::located_exception("プールより大きなオブジェクトの確保");
+
+	}
+
+	template<typename t>
+	void destruct(ptr_type<t>& ptr) {
+
+		for (auto& i : _chunks)
+		{
+			if (i.is_contains(ptr.get())) {
+				i.destruct<t>(ptr);
+				return;
+			}
+		}
+
+		throw error::located_exception("プールに存在しないオブジェクトの破棄");
+	}
+
+	void gc() {
+
+		for (auto& i :_chunks)
+		{
+			i.gc();
+		}
+	}
+};
