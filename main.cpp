@@ -124,7 +124,8 @@ void test_gc_compaction() {
 
     std::cout << "===== gc compaction =====\n";
 
-    anytype_pool<256>::chunk<256> chunk;
+    std::pmr::polymorphic_allocator<anytype_pool<256>::chunk<256>::info> alloc;
+    anytype_pool<256>::chunk<256> chunk(alloc);
 
     auto a = chunk.construct_unique<packed_data>(1);
     auto b = chunk.construct_unique<packed_data>(2);
@@ -179,7 +180,8 @@ void test_dead_space() {
 
     std::cout << "===== dead space =====\n";
 
-    anytype_pool<256>::chunk<256> chunk;
+    std::pmr::polymorphic_allocator<anytype_pool<256>::chunk<256>::info> alloc;
+    anytype_pool<256>::chunk<256> chunk(alloc);
 
     auto a = chunk.construct_unique<lifecheck>(1);
     auto b = chunk.construct_unique<lifecheck>(2);
@@ -568,14 +570,14 @@ void benchmark_pmr_pool(
 
     std::cout << "\n===== std::pmr::unsynchronized_pool_resource =====\n";
 
+    std::pmr::unsynchronized_pool_resource pool;
+
+    std::pmr::polymorphic_allocator<test_object> alloc(&pool);
     {
         scoped_timer timer("construct + destruct");
 
         for (size_t loop = 0; loop < loop_count; loop++)
         {
-            std::pmr::unsynchronized_pool_resource pool;
-
-            std::pmr::polymorphic_allocator<test_object> alloc(&pool);
 
             std::vector<test_object*> ptrs;
             ptrs.reserve(object_count);
@@ -604,10 +606,6 @@ void benchmark_pmr_pool(
 
     {
         scoped_timer timer("construct only");
-
-        std::pmr::unsynchronized_pool_resource pool;
-
-        std::pmr::polymorphic_allocator<test_object> alloc(&pool);
 
         std::vector<test_object*> ptrs;
         ptrs.reserve(object_count);
@@ -719,28 +717,29 @@ int main() {
             << "loop count : "
             << loop_count
             << "\n";
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         benchmark_new_delete(
             object_count,
             loop_count
         );
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         benchmark_mem_pool(
             object_count,
             loop_count
         );
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         benchmark_custom_pool(
             object_count,
             loop_count
         );
 
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         benchmark_pmr_pool(
             object_count,
             loop_count
         );
 
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         benchmark_monotonic_pool(
             object_count,
             loop_count

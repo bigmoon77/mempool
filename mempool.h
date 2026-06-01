@@ -183,6 +183,7 @@ public:
 		
 		struct typeinfo {
 			size_t tsize = 0;
+			size_t talign = 0;
 			void (*destruct)(void*) = nullptr;
 			void (*move)(void*, void*) = nullptr;
 		};
@@ -233,9 +234,9 @@ public:
 		// これstaticでいい気もするけど後々のマルチスレッド対応を考えると困る
 		//後々考えます
 		std::map<std::type_index, typeinfo> typemap;
-		
+
 		// 変数の参照するポインタ群
-		std::list<info> infos;
+		std::pmr::list<info> infos;
 		
 		//解放済みの未回収サイズ
 		size_t released = 0;
@@ -252,10 +253,15 @@ public:
 #ifdef _DEBUG 
 		std::source_location _loc;
 		
-		chunk(const std::source_location& loc = std::source_location::current()) 
-			:_loc(loc)
+		chunk(std::pmr::polymorphic_allocator<info>& info_allocator,const std::source_location& loc = std::source_location::current())
+			:_loc(loc), infos(info_allocator)
 		{
 			
+		}
+#else 
+		chunk(std::pmr::polymorphic_allocator<info>& info_allocator): infos(info_allocator)
+		{
+
 		}
 #endif 
 
@@ -290,10 +296,15 @@ public:
 		template<typename t, typename... types>
 		unique_ptr<t> construct_unique(types&&... args) {
 
-			auto new_ind = back_ind + sizeof(t);
+			size_t align_remainder = ((uintptr_t)&data[back_ind]) % alignof(t);
+
+			auto new_ind = back_ind + sizeof(t) + align_remainder;//現在位置がアラインメントに適している場合、indexを加算する
+
 			if (new_ind > max_byte) {
 				return {};
 			}
+
+			back_ind += align_remainder;
 
 			new ((t*)&data[back_ind]) t(std::forward<types>(args)...);
 
@@ -314,6 +325,7 @@ public:
 
 			tmp.tid = typeid(t);
 			type.tsize = sizeof(t);
+			type.talign = alignof(t);
 
 			return unique_ptr<t>((t**)(char*)&infos.emplace_back(tmp), deleter(type, released));
 
@@ -322,11 +334,13 @@ public:
 		template<typename t, typename... types>
 		std::shared_ptr<t*> construct_shared(types&&... args) {
 
-			auto new_ind = back_ind + (sizeof(t));
+			size_t align_remainder = ((uintptr_t)&data[back_ind]) % alignof(t);
+			auto new_ind = back_ind + sizeof(t) + align_remainder;
 			if (new_ind > max_byte) {
 				return {};
 			}
 
+			back_ind += align_remainder;
 			new ((t*)&data[back_ind]) t(std::forward<types>(args)...);
 
 			info tmp;
@@ -342,6 +356,7 @@ public:
 
 			tmp.tid = typeid(t);
 			type.tsize = sizeof(t);
+			type.talign = alignof(t);
 
 			return std::shared_ptr<t*>((t**)(char*)&infos.emplace_back(tmp), deleter(type, released));
 		}
@@ -391,14 +406,14 @@ public:
 				});
 
 			size_t offset = 0;
-			infos.sort();
-
-			typeinfo* tip = nullptr;
+			typeinfo* tip;
 
 			//アドレス昇順
 			for (auto& i : infos)
 			{
 				tip = &typemap[i.tid];
+
+				offset += ((uintptr_t)&data[offset]) % tip->talign;
 
 				if (tip->move) {
 					tip->move(&data[offset], i.ptr);
@@ -484,6 +499,9 @@ public:
 	using shared_ptr_type = typename std::shared_ptr<t>;
 
 private:
+	std::pmr::unsynchronized_pool_resource _info_pool;
+	std::pmr::polymorphic_allocator<typename chunk_type::info> _info_allocator;
+
 	std::list<chunk_type> _chunks;
 public:
 
@@ -493,8 +511,12 @@ private:
 	std::source_location _loc;
 public:
 	anytype_pool(const std::source_location& loc = std::source_location::current())
-		:_loc(loc)
+		:_loc(loc),_info_allocator(&_info_pool)
 	{
+
+	}
+#else
+	anytype_pool() :_info_allocator(&_info_pool){
 
 	}
 #endif
@@ -505,9 +527,9 @@ public:
 		if (_chunks.empty()) {
 
 #ifdef _DEBUG 
-			_chunks.emplace_back(_loc);
+			_chunks.emplace_back(_info_allocator, _loc);
 #else
-			_chunks.emplace_back();
+			_chunks.emplace_back(_info_allocator);
 #endif
 		}
 
@@ -526,9 +548,9 @@ public:
 		}
 
 #ifdef _DEBUG 
-		_chunks.emplace_back(_loc);
+		_chunks.emplace_back(_info_allocator, _loc);
 #else
-		_chunks.emplace_back();
+		_chunks.emplace_back(_info_allocator);
 #endif
 		auto& back = _chunks.back();
 
@@ -549,9 +571,9 @@ public:
 		if (_chunks.empty()) {
 
 #ifdef _DEBUG 
-			_chunks.emplace_back(_loc);
+			_chunks.emplace_back(_info_allocator, _loc);
 #else
-			_chunks.emplace_back();
+			_chunks.emplace_back(_info_allocator);
 #endif
 		}
 
@@ -570,9 +592,9 @@ public:
 		}
 
 #ifdef _DEBUG 
-		_chunks.emplace_back(_loc);
+		_chunks.emplace_back(_info_allocator, _loc);
 #else
-		_chunks.emplace_back();
+		_chunks.emplace_back(_info_allocator);
 #endif
 		auto& back = _chunks.back();
 
@@ -622,7 +644,8 @@ public:
 	struct chunk {
 		
 		struct typeinfo {
-			size_t tsize = 0;
+			size_t tsize  = 0;
+			size_t talign = 0;
 			void (*destruct)(void*, size_t) = nullptr;
 			void (*move)(void*, void*, size_t) = nullptr;
 		};
@@ -665,7 +688,7 @@ public:
 		static inline constexpr size_t max_byte = pool_size;
 
 		std::map<std::type_index, typeinfo> typemap;
-		std::list<info> infos;
+		std::pmr::list<info> infos;
 		size_t released = 0;
 		size_t back_ind = 0;
 		std::uint8_t data[max_byte];
@@ -673,9 +696,15 @@ public:
 
 #ifdef _DEBUG
 		std::source_location _loc;
-		chunk(const std::source_location& loc = std::source_location::current()) 
-			:_loc(loc)
+		chunk(std::pmr::polymorphic_allocator<info>& info_allocator, const std::source_location& loc = std::source_location::current())
+			:_loc(loc), infos(info_allocator)
 		{
+
+		}
+
+#else
+
+		chunk(std::pmr::polymorphic_allocator<info>& info_allocator) :infos(info_allocator){
 
 		}
 #endif
@@ -711,10 +740,14 @@ public:
 		template<typename t, typename... types>
 		unique_ptr<t> construct_unique(size_t num,types&&... args) {
 
-			auto new_ind = back_ind + (num * sizeof(t));
+			auto remainder = ((uintptr_t)&data[back_ind]) % alignof(t);
+
+			auto new_ind = back_ind + (num * sizeof(t)) + remainder;
 			if (new_ind > max_byte) {
 				return {};
 			}
+
+			back_ind += remainder;
 
 			auto ptr = (t*)&data[back_ind];
 			for (size_t i = 0; i < num; i++)
@@ -736,6 +769,7 @@ public:
 			tmp.tid = typeid(t);
 			tmp.num = num;
 			type.tsize = sizeof(t);
+			type.talign = alignof(t);
 
 			return unique_ptr<t>((t**)(char*)&infos.emplace_back(tmp), deleter(type, released));
 
@@ -744,10 +778,14 @@ public:
 		template<typename t, typename... types>
 		std::shared_ptr<t*> construct_shared(size_t num,types&&... args) {
 
+			auto remainder = ((uintptr_t)&data[back_ind]) % alignof(t);
+
 			auto new_ind = back_ind + (num * sizeof(t));
 			if (new_ind > max_byte) {
 				return {};
 			}
+
+			back_ind += remainder;
 
 			auto ptr = (t*)&data[back_ind];
 			for (size_t i = 0; i < num; i++)
@@ -769,6 +807,7 @@ public:
 			tmp.tid = typeid(t);
 			tmp.num = num;
 			type.tsize = sizeof(t);
+			type.talign = alignof(t);
 
 			return std::shared_ptr<t*>((t**)(char*)&infos.emplace_back(tmp), deleter(type, released));
 
@@ -820,14 +859,13 @@ public:
 				});
 
 			size_t offset = 0;
-			infos.sort();
-
-			typeinfo* tip = nullptr;
+			typeinfo* tip;
 
 			//アドレス昇順
 			for (auto& i : infos)
 			{
 				tip = &typemap[i.tid];
+				offset += ((uintptr_t)&data[offset]) % tip->talign;
 
 				if (tip->move) {
 					tip->move(&data[offset], i.ptr, i.num);
@@ -909,6 +947,8 @@ public:
 	using shared_ptr_type = typename std::shared_ptr<t*>;
 
 private:
+	std::pmr::unsynchronized_pool_resource _info_pool;
+	std::pmr::polymorphic_allocator<typename chunk_type::info> _info_allocator;
 	std::list<chunk_type> _chunks;
 public:
 
@@ -917,7 +957,13 @@ private:
 	std::source_location _loc;
 public:
 	arraysup_anytype_pool(const std::source_location& loc = std::source_location::current())
-		:_loc(loc)
+		:_loc(loc), _info_allocator(&_info_pool)
+	{
+
+	}
+#else 
+	arraysup_anytype_pool() 
+		: _info_allocator(&_info_pool)
 	{
 
 	}
@@ -928,9 +974,9 @@ public:
 
 		if (_chunks.empty()) {
 #ifdef _DEBUG
-			_chunks.emplace_back(_loc);
+			_chunks.emplace_back(_info_allocator,_loc);
 #else
-			_chunks.emplace_back();
+			_chunks.emplace_back(_info_allocator);
 #endif
 		}
 			
@@ -950,9 +996,9 @@ public:
 			}
 		}
 #ifdef _DEBUG
-		_chunks.emplace_back(_loc);
+		_chunks.emplace_back(_info_allocator, _loc);
 #else
-		_chunks.emplace_back();
+		_chunks.emplace_back(_info_allocator);
 #endif
 		auto& back = _chunks.back();
 
@@ -971,9 +1017,9 @@ public:
 
 		if (_chunks.empty()) {
 #ifdef _DEBUG
-			_chunks.emplace_back(_loc);
+			_chunks.emplace_back(_info_allocator, _loc);
 #else
-			_chunks.emplace_back();
+			_chunks.emplace_back(_info_allocator);
 #endif
 		}
 
@@ -991,9 +1037,9 @@ public:
 			}
 		}
 #ifdef _DEBUG
-		_chunks.emplace_back(_loc);
+		_chunks.emplace_back(_info_allocator, _loc);
 #else
-		_chunks.emplace_back();
+		_chunks.emplace_back(_info_allocator);
 #endif
 		auto& back = _chunks.back();
 
