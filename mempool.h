@@ -372,6 +372,7 @@ public:
 			if (itr == infos.end()) {
 				throw error::located_exception("プールに含まれないオブジェクトの破棄");
 			}
+			
 			ptr.reset();
 
 			infos.erase(itr);
@@ -447,8 +448,9 @@ public:
 			return released;
 		}
 
-		bool constructable(const size_t& byte) {
-			return (back_ind + byte) <= max_byte;
+		bool constructable(const size_t& byte,const size_t& align) {
+			return (back_ind + byte + 
+				(((uintptr_t)&data[back_ind])) % align) <= max_byte;
 		}
 
 		bool is_contains(void* block) const {
@@ -535,13 +537,13 @@ public:
 
 		for (auto& i : _chunks)
 		{
-			if (i.constructable(sizeof(t))) {
+			if (i.constructable(sizeof(t), alignof(t))) {
 				return i.template construct_unique<t, types...>(std::forward<types>(args)...);
 			}
 			else if(i.dead_space() > sizeof(t) * 5){
  
 				i.gc();
-				if (i.constructable(sizeof(t))) {
+				if (i.constructable(sizeof(t),alignof(t))) {
 					return i.template construct_unique<t, types...>(std::forward<types>(args)...);
 				}
 			}
@@ -555,7 +557,7 @@ public:
 		auto& back = _chunks.back();
 
 #ifdef _DEBUG
-		if (!back.constructable(sizeof(t))) {
+		if (!back.constructable(sizeof(t), alignof(t))) {
 
 			throw error::located_exception("プールより大きなオブジェクトの確保");
 		}
@@ -579,13 +581,13 @@ public:
 
 		for (auto& i : _chunks)
 		{
-			if (i.constructable(sizeof(t))) {
+			if (i.constructable(sizeof(t), alignof(t))) {
 				return i.template construct_shared<t, types...>(std::forward<types>(args)...);
 			}
 			else if (i.dead_space() > sizeof(t) * 5) {
 
 				i.gc();
-				if (i.constructable(sizeof(t))) {
+				if (i.constructable(sizeof(t), alignof(t))) {
 					return i.template construct_shared<t, types...>(std::forward<types>(args)...);
 				}
 			}
@@ -599,7 +601,7 @@ public:
 		auto& back = _chunks.back();
 
 #ifdef _DEBUG
-		if (!back.constructable(sizeof(t))) {
+		if (!back.constructable(sizeof(t), alignof(t))) {
 
 			throw error::located_exception("プールより大きなオブジェクトの確保");
 		}
@@ -611,6 +613,7 @@ public:
 
 	template<typename t>
 	void destruct(unique_ptr_type<t>& ptr) {
+		if (!ptr) return;
 
 		for (auto& i : _chunks)
 		{
@@ -886,8 +889,9 @@ public:
 			return released;
 		}
 
-		bool constructable(const size_t& byte,const size_t& num) const{
-			return (back_ind + (num * byte)) <= max_byte;
+		bool constructable(const size_t& byte,const size_t& num,const size_t& align) const{
+			return (back_ind + (num * byte) +
+				((uintptr_t)&data[back_ind]) % align) <= max_byte;
 		}
 
 		bool is_contains(void* block) const {
@@ -984,13 +988,13 @@ public:
 
 		for (auto& i : _chunks)
 		{
-			if (i.constructable(sizeof(t), num)) {
+			if (i.constructable(sizeof(t), num, alignof(t))) {
 				return i.template construct_unique<t, types...>(num, std::forward<types>(args)...);
 			}
 			else if (i.dead_space() > sizeof(t) * 5) {
 
 				i.gc();
-				if (i.constructable(sizeof(t), num)) {
+				if (i.constructable(sizeof(t), num, alignof(t))) {
 					return i.template construct_unique<t, types...>(num, std::forward<types>(args)...);
 				}
 			}
@@ -1003,7 +1007,7 @@ public:
 		auto& back = _chunks.back();
 
 #ifdef _DEBUG
-		if (!back.constructable(sizeof(t), num)) {
+		if (!back.constructable(sizeof(t), num, alignof(t))) {
 
 			throw error::located_exception("プールより大きなオブジェクトの確保");
 		}
@@ -1025,13 +1029,13 @@ public:
 
 		for (auto& i : _chunks)
 		{
-			if (i.constructable(sizeof(t), num)) {
+			if (i.constructable(sizeof(t), num, alignof(t))) {
 				return i.template construct_shared<t, types...>(num, std::forward<types>(args)...);
 			}
 			else if (i.dead_space() > sizeof(t) * 5) {
 
 				i.gc();
-				if (i.constructable(sizeof(t)), num) {
+				if (i.constructable(sizeof(t), num, alignof(t))) {
 					return i.template construct_shared<t, types...>(num, std::forward<types>(args)...);
 				}
 			}
@@ -1044,7 +1048,7 @@ public:
 		auto& back = _chunks.back();
 
 #ifdef _DEBUG
-		if (!back.constructable(sizeof(t), num)) {
+		if (!back.constructable(sizeof(t), num,alignof(t))) {
 
 			throw error::located_exception("プールより大きなオブジェクトの確保");
 		}
@@ -1056,6 +1060,7 @@ public:
 
 	template<typename t>
 	void destruct(unique_ptr_type<t>& ptr) {
+		if (!ptr) return;
 
 		for (auto& i : _chunks)
 		{
