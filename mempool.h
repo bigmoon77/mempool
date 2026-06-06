@@ -498,7 +498,7 @@ public:
 	using unique_ptr_type = typename chunk_type::template unique_ptr <t>;
 
 	template<typename t>
-	using shared_ptr_type = typename std::shared_ptr<t>;
+	using shared_ptr_type = typename std::shared_ptr<t*>;
 
 private:
 	std::pmr::unsynchronized_pool_resource _info_pool;
