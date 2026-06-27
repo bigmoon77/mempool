@@ -5,7 +5,7 @@
 #include <typeindex>
 #include <algorithm>
 #include <memory_resource>
-
+#include "error\located_exception.h"
 
 /*
 multi thread gcにて最大の課題とは
@@ -67,9 +67,9 @@ struct mempool {
 	};
 
 	struct inst_info {
-		std::type_index tid;
-		size_t array_size = 1;
 		void* ptr = nullptr;//オブジェクトが格納されたptrを指す
+		size_t array_size = 1;
+		std::type_index tid;
 	};
 
 	struct inst_deleter {
@@ -81,33 +81,15 @@ struct mempool {
 		using t = int;
 
 		void operator()(const void* block)const {
-			if constexpr (!std::is_trivially_copyable_v<t>) {//トリビアル型以外はデストラクト
-				reinterpret_cast<const t*>(block)->~t();
+			auto info = reinterpret_cast<const inst_info*>(block);
+
+			if constexpr (!std::is_trivially_copyable_v<t>) {//トリビアル型以外はデストラクト	
+				for (size_t i = 0; i < info->array_size; i++)
+				{
+					reinterpret_cast<t*>(info->ptr)[i].~t();
+				}
 			}
-			owner->deallocate(block, sizeof(t), alignof(t));
-		}
-	};
-
-	class accessor {
-		inst_info* info = nullptr;
-		accessor(inst_info& info) : info(&info) {
-
-		}
-		using t = int;
-
-		t* get() {
-			return reinterpret_cast<t*> (info->ptr);
-		}
-		const t* get() const {
-			return reinterpret_cast<const t*> (info->ptr);
-		}
-
-		size_t size()const {
-			return info->array_size;
-		}
-
-		std::type_index get_type() const {
-			return info->tid;
+			owner->deallocate(info->ptr, sizeof(t), alignof(t));
 		}
 	};
 
@@ -127,14 +109,76 @@ struct mempool {
 	using t = int;
 
 	//single,single
-	static void move(void* src, void* dst) {
+	static void move(char* dst, char* src) {
 
-		
+		if constexpr (std::is_trivially_copyable_v<t>) {
+			std::memmove(dst, src, sizeof(t));
+		}
+		else {
+#ifdef _DEBUG
+			if (dst < src) {//dstの方が前であるべき
+				throw error::located_exception("fetal error invalid object move");
+			}
+#endif
 
+			//アドレス距離がオブジェクトのサイズ未満だった場合、移動先と移動元は重なっている
+
+			if ((dst - src) < sizeof(t)) {
+
+				t temp (std::move(
+					*reinterpret_cast<t*>(src)
+				));
+
+				reinterpret_cast<t*>(src)->~t();
+
+				new (dst)t(std::move(temp));
+			}
+			else {
+				new (dst) t(
+					std::move(
+						*reinterpret_cast<t*>(src)
+					)
+				);
+				reinterpret_cast<t*>(src)->~t();
+			}
+
+		}
 
 	}
-	static void move(void* src, void* dst,size_t src_size,size_t dst_size) {
+	static void move(char* dst,char* src,size_t size) {
 
+		if constexpr (std::is_trivially_copyable_v<t>) {
+			std::memmove(dst, src, sizeof(t));
+		}
+		else {
+#ifdef _DEBUG
+			if (dst < src) {//dstの方が前であるべき
+				throw error::located_exception("fetal error invalid object move");
+			}
+#endif
+
+			//アドレス距離がオブジェクトのサイズ未満だった場合、移動先と移動元は重なっている
+
+			if ((dst - src) < sizeof(t)) {//間が１要素以上あるならば問題はない為この境界
+
+				t temp(std::move(
+					*reinterpret_cast<t*>(src)
+				));
+
+				reinterpret_cast<t*>(src)->~t();
+
+				new (dst)t(std::move(temp));
+			}
+			else {
+				new (dst) t(
+					std::move(
+						*reinterpret_cast<t*>(src)
+					)
+				);
+				reinterpret_cast<t*>(src)->~t();
+			}
+
+		}
 		
 	}
 
