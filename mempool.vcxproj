@@ -134,6 +134,7 @@
   <ItemGroup>
     <ClInclude Include="error\located_exception.h" />
     <ClInclude Include="mempool.h" />
+    <ClInclude Include="mt_mempool.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
