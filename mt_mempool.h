@@ -30,6 +30,11 @@ struct mt_mempool {
 		}
 
 		void lock(void* ptr) {
+			/*
+			現状ここが一番のオーバーヘッド　
+			ここを高速化しない限り話にならない
+			
+			*/
 
 			std::lock_guard lock(mtx);
 
@@ -241,6 +246,8 @@ struct mt_mempool {
 
 
 			{
+				scoped_timer get_lock("ptr lock");
+
 				ptr_barrier.lock(info_ptr);
 
 				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
@@ -534,25 +541,70 @@ struct mt_mempool {
 	pointer_barrier ptr_barrier;
 	std::vector<std::unique_ptr<allocator>> chunk_arr;
 
-	size_t last_size = 256;
+	size_t last_size = 100000;
 	
-	template<typename t>
-	std::unique_ptr<t*,inst_deleter<t>> construct(size_t size = 1) {
+	mt_mempool() {
 
 		if (chunk_arr.empty()) {
 			last_size *= 2;
-			chunk_arr.emplace_back(std::make_unique<allocator>(ptr_barrier,last_size));
+			chunk_arr.emplace_back(std::make_unique<allocator>(ptr_barrier, last_size));
 		}
+	}
+
+	class scoped_timer {
+		using clock = std::chrono::high_resolution_clock;
+
+		std::string _name;
+		clock::time_point _begin;
+
+	public:
+		scoped_timer(std::string name)
+			: _name(std::move(name)), _begin(clock::now()) {
+		}
+
+		~scoped_timer() {
+			auto end = clock::now();
+
+			auto ns =
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					end - _begin).count();
+
+			std::cout
+				<< std::setw(32)
+				<< std::left
+				<< _name
+				<< " : "
+				<< ns
+				<< " ns"
+				<< std::endl;
+		}
+	};
+
+	template<typename t>
+	std::unique_ptr<t*,inst_deleter<t>> construct(size_t size = 1) {
+
 		
 		t* ptr = nullptr;
 		allocator* owner = nullptr;
 
-		for (auto& chunk: chunk_arr)
 		{
-			if (chunk->allocateable(sizeof(t) * size, alignof(t))) {
-				ptr = reinterpret_cast<t*>(chunk->allocate(sizeof(t) * size, alignof(t)));
-				owner = chunk.get();
-				break;
+			scoped_timer timer("find_chunk");
+
+			for (auto& chunk : chunk_arr)
+			{
+				if (chunk->allocateable(sizeof(t) * size, alignof(t))) {
+
+
+					{
+						//scoped_timer timer("allocate");
+
+						ptr = reinterpret_cast<t*>(chunk->allocate(sizeof(t) * size, alignof(t)));
+					}
+
+
+					owner = chunk.get();
+					break;
+				}
 			}
 		}
 
@@ -570,7 +622,13 @@ struct mt_mempool {
 			new (&ptr[i])t();
 		}
 
-		auto info_ptr = owner->make_inst<t>((char*)ptr, size, typeid(t));
+		inst_info* info_ptr;
+		{
+			scoped_timer timer("make_inst");
+
+			info_ptr = owner->make_inst<t>((char*)ptr, size, typeid(t));
+		}
+
 
 		return std::unique_ptr<t*, inst_deleter<t>>((t**)(char*)info_ptr, inst_deleter<t>(owner));
 	}
