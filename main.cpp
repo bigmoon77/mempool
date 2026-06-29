@@ -699,19 +699,26 @@ int main() {
     
     {
         mt_mempool pool;
-        auto ptr1 = pool.construct();
-        auto ptr0 = pool.construct();
-        **ptr0 = 14789;
-        std::cout << *ptr0 << std::endl;
-        std::cout << **ptr0 << std::endl;
+        pool.init_thread();
 
-        ptr1.reset();
 
-        pool.chunk_arr.back()->gc();
+        for (size_t i = 0; i < 10000; i++)
+        {
 
-        std::cout << **ptr0 << std::endl;
-        std::cout << *ptr0 << std::endl;
-        
+            auto ptr1 = pool.construct();
+            auto ptr0 = pool.construct();
+            **ptr0 = 14789;
+            std::cout << *ptr0 << std::endl;
+            std::cout << **ptr0 << std::endl;
+
+            ptr1.reset();
+
+            pool.chunk_arr.back()->gc();
+
+            std::cout << **ptr0 << std::endl;
+            std::cout << *ptr0 << std::endl;
+
+        }
     }
 
     
