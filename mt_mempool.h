@@ -299,10 +299,6 @@ struct mt_mempool {
 
 			size_t wait_ind = 0;//wait_ind[wait_ind]の部分は飛ばして読む
 			
-			//最後尾のinst_info
-			//ケツから確保しているので注意
-			auto inst_tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
-
 
 			//ダブルバッファリング
 			std::vector<size_t> temp_wait_inst_index_arr;
@@ -314,94 +310,70 @@ struct mt_mempool {
 
 				gc_now = true;//追加もここのmtxで行われるので漏らしはない
 			}
-			
+
 
 			//非同期フェーズ
 #pragma region
-			if (temp_wait_inst_index_arr.size()) {
+			{
+				std::vector<size_t> inst_ind_arr;
+				inst_ind_arr.resize(temp_inst_ind - temp_wait_inst_index_arr.size());
 
 
-				for (size_t i = 0; i < temp_inst_ind; i++)
-				{
-					if (i != temp_wait_inst_index_arr[wait_ind]) {
+				if (temp_wait_inst_index_arr.size()) {
+					size_t j = 0;
+					size_t k = 0;
 
-						inst_info* inst_ptr = (inst_tail - i);
-
-						ptr_barrier.lock(inst_ptr);
-						if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
-							continue;
+					for (size_t i = 0; i < temp_inst_ind; i++)
+					{
+						if (i != temp_wait_inst_index_arr[j]) {//iは待機indexではない
+							inst_ind_arr[k++] = i;//そのindexが待機indexかを見る
 						}
-						ptr_barrier.unlock();
+						else {
 
 
+							if (temp_wait_inst_index_arr.size() == ++j) {//あとは空白無し
 
-						const type_info* type;
-
-						{
-							std::lock_guard tmap_lock(tmap_mtx);
-							type = &(*tmap.find({ inst_ptr->tid,nullptr }));
-						}
-
-
-
-						auto preview_loc = inst_ptr->ptr;
-						inst_ptr->ptr = next_ptr;//new loc
-
-						//アラインメント考慮は関数が行う
-						//帰り値は次のptr
-						next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
-					}
-					else {
-						if (temp_wait_inst_index_arr.size() == ++wait_ind) {
-							//以降はwaitがないことが確定しているのでif無しloopに飛ばす
-
-							for (size_t j = i + 1; j < temp_inst_ind; j++)
-							{
-								inst_info* inst_ptr = (inst_tail - j);
-
-
-								ptr_barrier.lock((char*)inst_ptr);
-								if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
-									continue;
-								}
-								ptr_barrier.unlock();
-
-
-								const type_info* type;
-
+								for (size_t l = i + 1; l < temp_inst_ind; ++l)
 								{
-									std::lock_guard tmap_lock(tmap_mtx);
-									type = &(*tmap.find({ inst_ptr->tid,nullptr }));
+									inst_ind_arr[k++] = l;
 								}
 
-								auto preview_loc = inst_ptr->ptr;
-								inst_ptr->ptr = next_ptr;//new loc
-
-								//アラインメント考慮は関数が行う
-								//帰り値は次のptr
-								next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+								break;
 							}
-
-
-							break;
 						}
-						continue;
+
+					}
+				}
+				else {
+
+					for (size_t i = 0; i < temp_inst_ind; i++)
+					{
+						inst_ind_arr[i] = i;
 					}
 				}
 
+				//最後尾のinst_info
+				//ケツから確保しているので注意
+				auto inst_tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
 
-			}
-			else {
-				//wait無しの場合はif無しloop
+				std::sort(inst_ind_arr.begin(), inst_ind_arr.end(),
+					[&inst_tail](const size_t& l, const size_t& r) {
+						return
+							(inst_tail - l)->ptr <
+							(inst_tail - r)->ptr;
+					});
 
-				for (size_t j = 0; j < temp_inst_ind; j++)
+
+				for (auto& i : inst_ind_arr)
 				{
-					inst_info* inst_ptr = (inst_tail - j);
-					ptr_barrier.lock((char*)inst_ptr);
+					inst_info* inst_ptr = (inst_tail - i);
+
+					ptr_barrier.lock(inst_ptr);
 					if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
 						continue;
 					}
 					ptr_barrier.unlock();
+
 
 
 					const type_info* type;
@@ -411,6 +383,8 @@ struct mt_mempool {
 						type = &(*tmap.find({ inst_ptr->tid,nullptr }));
 					}
 
+
+
 					auto preview_loc = inst_ptr->ptr;
 					inst_ptr->ptr = next_ptr;//new loc
 
@@ -418,10 +392,8 @@ struct mt_mempool {
 					//帰り値は次のptr
 					next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
 				}
-
-
-
 			}
+
 
 #pragma endregion
 
@@ -430,6 +402,10 @@ struct mt_mempool {
 #pragma region
 
 			{
+				//最後尾のinst_info
+				//ケツから確保しているので注意
+				auto inst_tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
+
 				//backindの固定に必要
 				std::lock_guard allo_lock(allo_deallo_mtx);
 				//gc中に追加されたオブジェクトだけ追跡する機能が必要
@@ -570,6 +546,7 @@ struct mt_mempool {
 		
 		t* ptr = nullptr;
 		allocator* owner = nullptr;
+
 		for (auto& chunk: chunk_arr)
 		{
 			if (chunk->allocateable(sizeof(t) * size, alignof(t))) {
