@@ -2,10 +2,12 @@
 #include <memory>
 #include <shared_mutex>
 #include <vector>
+#include <atomic>
+#include <set>
 #include <typeindex>
 #include <algorithm>
 #include <memory_resource>
-#include "error\located_exception.h"
+#include "error/located_exception.h"
 
 /*
 multi thread gcにて最大の課題とは
@@ -20,13 +22,11 @@ gcは常にメモリを監視し、空き領域を定期的に詰めていく
 struct mt_mempool {
 	
 	struct type_info {
-		std::type_index tid;
-		size_t tsize  = 0;
-		size_t talign = 0;
-		
+		std::type_index tid = typeid(int);
+
 		void (*destruct)(void*, size_t) = nullptr;
-		//src,dst
-		void (*move)(char*, char*,size_t) = nullptr;
+		//dst,src
+		char* (*move)(char*&, char*,size_t) = nullptr;
 
 
 		bool operator < (const type_info& other)const {
@@ -39,10 +39,13 @@ struct mt_mempool {
 			return tid == other.tid;
 		}
 	};
-
+	/*
 	struct type_map {
 		std::vector<type_info> cont;
 		std::shared_mutex cont_mtx;
+
+		type_map() = default;
+
 
 		template<typename t>
 		decltype(cont)::const_iterator add() {
@@ -107,79 +110,342 @@ struct mt_mempool {
 		}
 
 	};
-
-
+	*/
 	struct inst_info {
-		void* ptr = nullptr;//オブジェクトが格納されたptrを指す
+		char* ptr = nullptr;//オブジェクトが格納されたptrを指す
 		size_t array_size = 1;
-		std::type_index tid;
+		std::type_index tid = typeid(int);
 	};
 
 	struct allocator {
-		type_map tmap;
-		std::pmr::unsynchronized_pool_resource& info_pool;
+		//type_map tmap;
+
+		mutable std::mutex allo_deallo_mtx;
+		mutable std::mutex tmap_mtx;
+		mutable std::mutex wait_inst_mtx;
+		mutable std::mutex ptr_mtx;
+
+		std::set<type_info> tmap;
 
 		std::unique_ptr<char[]> data;
-		std::pmr::vector<inst_info*> info_vec;
 
+		//次オブジェクトを作成する際のindex
 		size_t back_ind = 0;
-		size_t dead_space = 0;
+
+		//次作成する際のinst_infoのindex
+		size_t inst_ind = 0;
+		
+	
+		//取りえる最大のindex
 		size_t max_ind = 0;
 
-		allocator(std::pmr::unsynchronized_pool_resource& info_pool,size_t size)
-			: info_pool(info_pool),
-			data(std::make_unique_for_overwrite<char[]>(size)),
+		//破棄したオブジェクトの総サイズ
+		std::atomic_size_t dead_space = 0;
+		/// <summary>
+		/// ロックされているinst_infoのptr
+		/// </summary>
+		std::atomic<char*> locked_ptr = nullptr;
+
+		std::vector<size_t> wait_inst_index_arr;
+
+		//gc中に追加されたオブジェクト
+		std::vector<size_t> gc_make_inst;
+		bool gc_now = false;
+
+
+		allocator(size_t size)
+			: data(std::make_unique_for_overwrite<char[]>(size)),
 			max_ind(size) {
 		}
 
-		void* allocate(size_t size,size_t align) {
-			
-			//次の取得アドレスがアラインに沿っているか
-			back_ind += (uintptr_t)&data[back_ind] % align;
+		~allocator() {
 
-			return &data[back_ind];
+#ifdef _DEBUG
+			
+			auto tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
+			size_t j = 0;
+			for (size_t i = 0; i < inst_ind; i++)
+			{
+				if (i == wait_inst_index_arr[j]) {
+					++j;
+					continue;
+				}
+
+				std::cerr << "leak " << (tail - i)->ptr << std::endl;
+			}
+#endif
 		}
 
-		void deallocate(const void* block,size_t size, size_t align) {
+		char* allocate(size_t size,size_t align) {
+			std::lock_guard lock(allo_deallo_mtx);
+
+			//次の取得アドレスがアラインに沿っているか
+			back_ind += (uintptr_t)&data[back_ind] % align;
+			auto res = &data[back_ind];
+
+			back_ind += size;
+
+			return res;
+		}
+
+		void deallocate(const char* block,size_t size, size_t align) {
 			dead_space += size;
 		}
 
 		bool allocateable(size_t size,size_t align) const {
-			return (back_ind + (uintptr_t)&data[back_ind] % align) <= max_ind;
+			std::lock_guard lock(allo_deallo_mtx);
+			return (back_ind + ((uintptr_t)&data[back_ind] % align)) +
+				(sizeof(inst_info) * inst_ind) <= max_ind;
 		}
 
 
-		inst_info* make_inst(void* ptr,size_t array_size,std::type_index tid) {
+		//オブジェクトへのコンストラクタは呼ばない
+		template<typename t>
+		inst_info* make_inst(char* ptr,size_t array_size,std::type_index tid) {
+			
+			inst_info* info_ptr;
 
-			auto info_ptr = (inst_info*)info_pool.allocate(sizeof(inst_info), alignof(inst_info));
+			{
+				std::lock_guard lock(wait_inst_mtx);
 
-			info_ptr->ptr = ptr;
-			info_ptr->array_size = array_size;
-			info_ptr->tid = tid;
+				if (wait_inst_index_arr.empty())
+					info_ptr = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]) -
+					(inst_ind++);
+				else {
+					info_ptr = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]) -
+						wait_inst_index_arr.back();
+					wait_inst_index_arr.pop_back();
+				}
 
-			info_vec.emplace_back(info_ptr);
+
+				if (gc_now) {
+
+					gc_make_inst.emplace_back(//gc中に生成された物ならばindexを記録
+						static_cast<size_t>(
+							(
+								inst_info*)&data[max_ind - sizeof(inst_info)] - info_ptr
+							)
+					);
+				}
+
+			}
+
+
+
+			{//型追加
+				type_info temp;
+				temp.tid = tid;
+				temp.destruct = &destruct<t>;
+				temp.move = &move<t>;
+
+				std::lock_guard lock(tmap_mtx);
+				tmap.emplace(temp);
+			}
+
+
+			{
+				
+				std::lock_guard lock(ptr_mtx);
+
+				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
+					new (info_ptr) inst_info();
+				}
+
+				locked_ptr.store((char*) info_ptr,std::memory_order_release);
+
+				info_ptr->ptr = ptr;//info更新　この時点でデストラクタは呼ばれている必要がある
+				info_ptr->array_size = array_size;
+				info_ptr->tid = tid;
+
+				locked_ptr.store(nullptr, std::memory_order_release);
+
+			}
+
 			return info_ptr;
 		}
 
+
+		//オブジェクトへのデストラクは呼ばない
 		void erase_inst(inst_info* ptr) {
-			auto itr = std::find(info_vec.begin(), info_vec.end(), ptr);
-			info_vec.erase(itr);
+
+			//gcが終わるまで待機
+
+			{
+				std::lock_guard lock(ptr_mtx);
+
+				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
+					ptr->~inst_info();
+				}
+
+				ptr->array_size = static_cast<size_t>(-1);//破棄フラグ
+			}
+
+			auto wait_ind = 
+				static_cast<size_t>(
+					reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]) -//最後尾のptr
+					ptr
+				);
+
+			std::lock_guard lock(wait_inst_mtx);
+			
+			wait_inst_index_arr.insert(
+				std::lower_bound(
+					wait_inst_index_arr.begin(), wait_inst_index_arr.end(),
+					wait_ind
+				),//insert_sort
+				wait_ind
+			);
 		}
 
 
 		void gc() {
 
-			auto head = data.get();
+			auto next_ptr = data.get();
 
-			for (auto& info_ptr : info_vec)
+			size_t wait_ind = 0;//wait_ind[wait_ind]の部分は飛ばして読む
+			
+			//最後尾のinst_info
+			//ケツから確保しているので注意
+			auto inst_tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
+
+
+			//ダブルバッファリング
+			std::vector<size_t> temp_wait_inst_index_arr;
+			size_t temp_inst_ind;
 			{
-				auto type = tmap.get(info_ptr->tid);
-				
-				type->move();
+				std::lock_guard lock(wait_inst_mtx);
+				temp_wait_inst_index_arr = wait_inst_index_arr;
+				temp_inst_ind = inst_ind;
 
+				gc_now = true;//追加もここのmtxで行われるので漏らしはない
+			}
+			
+
+			//非同期フェーズ
+#pragma region
+			for (size_t i = 0; i < temp_inst_ind; i++)
+			{
+				if (i != temp_wait_inst_index_arr[wait_ind]) {
+
+					inst_info* inst_ptr = (inst_tail - i);
+
+					//破棄領域に再度オブジェクトが追加されていた場合書込みで競合する可能性がある為ロック
+					std::lock_guard ptr_lock(ptr_mtx);
+
+					locked_ptr.store((char*)inst_ptr, std::memory_order_release);
+					if (inst_ptr->array_size == static_cast<size_t>(-1)) {//破棄済みフラグ
+						locked_ptr.store(nullptr, std::memory_order_release);
+						continue;
+					}
+
+					const type_info* type;
+
+					{
+						std::lock_guard tmap_lock(tmap_mtx);
+						type = &(*tmap.find({ inst_ptr->tid,nullptr,nullptr }));
+					}
+
+
+
+					auto preview_loc = inst_ptr->ptr;
+					inst_ptr->ptr = next_ptr;//new loc
+
+					//アラインメント考慮は関数が行う
+					//帰り値は次のptr
+					next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+
+					locked_ptr.store(nullptr, std::memory_order_release);
+
+				}
+				else {
+					if (temp_wait_inst_index_arr.size() == ++wait_ind) {
+						//以降はwaitがないことが確定しているのでif無しloopに飛ばす
+
+						for (size_t j = i + 1; j < temp_inst_ind; j++)
+						{
+							inst_info* inst_ptr = (inst_tail - j);
+
+
+							std::lock_guard ptr_lock(ptr_mtx);
+
+							locked_ptr.store((char*)inst_ptr, std::memory_order_release);
+							if (inst_ptr->array_size == static_cast<size_t>(-1)) {
+								locked_ptr.store(nullptr, std::memory_order_release);
+
+								continue;
+							}
+
+							const type_info* type;
+
+							{
+								std::lock_guard tmap_lock(tmap_mtx);
+								type = &(*tmap.find({ inst_ptr->tid,nullptr,nullptr }));
+							}
+
+							auto preview_loc = inst_ptr->ptr;
+							inst_ptr->ptr = next_ptr;//new loc
+
+							//アラインメント考慮は関数が行う
+							//帰り値は次のptr
+							next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+						}
+
+
+						std::lock_guard ptr_lock(ptr_mtx);
+
+						locked_ptr.store(nullptr, std::memory_order_release);
+
+						break;
+					}
+					continue;
+				}
 			}
 
-			
+#pragma endregion
+
+
+			//同期フェーズ
+#pragma region
+
+			{
+				//backindの固定に必要
+				std::lock_guard allo_lock(allo_deallo_mtx);
+				//gc中に追加されたオブジェクトだけ追跡する機能が必要
+				//back_indexの整合性を保つには、gc中追加されたインスタンスを走査し、これらのメモリ位置を変更する必要がある
+				
+				for (auto& i : gc_make_inst)
+				{
+					inst_info* inst_ptr = (inst_tail - i);
+					std::lock_guard ptr_lock(ptr_mtx);
+
+					locked_ptr.store(inst_ptr->ptr, std::memory_order_release);
+					if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
+						locked_ptr.store(nullptr, std::memory_order_release);
+						continue;
+					}
+
+					auto type = tmap.find({ inst_ptr->tid,nullptr,nullptr });
+
+					auto preview_loc = inst_ptr->ptr;
+					inst_ptr->ptr = next_ptr;//new loc
+
+					//アラインメント考慮は関数が行う
+					//帰り値は次のptr
+					next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+				}
+
+				std::lock_guard ptr_lock(ptr_mtx);
+
+				locked_ptr.store(nullptr, std::memory_order_release);
+				back_ind = static_cast<size_t>(next_ptr - data.get());
+
+				std::lock_guard wait_lock(wait_inst_mtx);
+				gc_now = false;
+			}
+#pragma endregion
+
+
+
 		}
 
 	};
@@ -203,7 +469,7 @@ struct mt_mempool {
 				}
 			}
 			owner->deallocate(info->ptr, sizeof(t), alignof(t));
-			owner->info_pool.deallocate(info, sizeof(inst_info), alignof(inst_info));
+			owner->erase_inst(info);
 		}
 	};
 
@@ -216,8 +482,22 @@ struct mt_mempool {
 		}
 	}
 
+	/// <summary>
+	/// 
+	/// 指定位置にオブジェクトを構築する
+	/// 次のオブジェクトアドレスを返す
+	/// 
+	/// dstはアラインメント調整して返される為注意
+	/// </summary>
+	/// <typeparam name="t"></typeparam>
+	/// <param name="dst"></param>
+	/// <param name="src"></param>
+	/// <param name="size"></param>
+	/// <returns></returns>
 	template<typename t>
-	static void move(char* dst,char* src,size_t size) {
+	static char* move(char*& dst,char* src,size_t size) {
+
+		dst += ((uintptr_t)dst % alignof(t));//アラインメント詰めのアドレスにする
 
 		if constexpr (std::is_trivially_copyable_v<t>) {
 			std::memmove(dst, src, sizeof(t));
@@ -258,18 +538,14 @@ struct mt_mempool {
 			}
 
 		}
-		
+
+
+		return dst + (sizeof(t) * size);
 	}
 
 
 
-	std::vector<allocator> chunk_arr;
-
-	std::vector<inst_info*> info_arr;
-
-	std::pmr::unsynchronized_pool_resource info_pool;
-
-	type_map type_map;
+	std::vector<std::unique_ptr<allocator>> chunk_arr;
 
 	size_t last_size = 256;
 
@@ -279,16 +555,16 @@ struct mt_mempool {
 
 		if (chunk_arr.empty()) {
 			last_size *= 2;
-			chunk_arr.emplace_back(info_pool, last_size);
+			chunk_arr.emplace_back(std::make_unique<allocator>(last_size));
 		}
 		
 		t* ptr = nullptr;
 		allocator* owner = nullptr;
 		for (auto& chunk: chunk_arr)
 		{
-			if (chunk.allocateable(sizeof(t), alignof(t))) {
-				ptr = reinterpret_cast<t*>(chunk.allocate(sizeof(t) * size, alignof(t)));
-				owner = &chunk;
+			if (chunk->allocateable(sizeof(t), alignof(t))) {
+				ptr = reinterpret_cast<t*>(chunk->allocate(sizeof(t) * size, alignof(t)));
+				owner = chunk.get();
 				break;
 			}
 		}
@@ -299,13 +575,7 @@ struct mt_mempool {
 			new (&ptr[i])t();
 		}
 
-		auto info_ptr = reinterpret_cast<inst_info*>(info_pool.allocate(sizeof(inst_info) * size, alignof(inst_info)));
-
-		info_ptr->ptr = ptr;
-		info_ptr->tid = typeid(t);
-		info_ptr->array_size = size;
-
-		info_arr.emplace_back(info_ptr);
+		auto info_ptr = owner->make_inst<t>((char*)ptr, size, typeid(t));
 
 		return std::unique_ptr<t*, inst_deleter<t>>((t**)(char*)info_ptr, inst_deleter<t>(owner));
 	}

@@ -696,6 +696,27 @@ void benchmark_monotonic_pool(
 
 int main() {
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+    
+    {
+        mt_mempool pool;
+        auto ptr1 = pool.construct();
+        auto ptr0 = pool.construct();
+        **ptr0 = 14789;
+        std::cout << *ptr0 << std::endl;
+        std::cout << **ptr0 << std::endl;
+
+        ptr1.reset();
+
+        pool.chunk_arr.back()->gc();
+
+        std::cout << **ptr0 << std::endl;
+        std::cout << *ptr0 << std::endl;
+        
+    }
+
+    
+    
+    return 0;
     test_pool();
         
 
