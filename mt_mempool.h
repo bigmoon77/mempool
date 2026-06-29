@@ -516,7 +516,7 @@ struct mt_mempool {
 		}
 		else {
 #ifdef _DEBUG
-			if (dst < src) {//dst‚Ì•û‚ª‘O‚Å‚ ‚é‚×‚«
+			if (dst > src) {//dst‚Ì•û‚ª‘O‚Å‚ ‚é‚×‚«
 				throw error::located_exception("fetal error invalid object move");
 			}
 #endif
@@ -560,7 +560,7 @@ struct mt_mempool {
 
 	size_t last_size = 256;
 	
-	using t = int;
+	template<typename t>
 	std::unique_ptr<t*,inst_deleter<t>> construct(size_t size = 1) {
 
 		if (chunk_arr.empty()) {
@@ -598,16 +598,16 @@ struct mt_mempool {
 		return std::unique_ptr<t*, inst_deleter<t>>((t**)(char*)info_ptr, inst_deleter<t>(owner));
 	}
 
-
 	void init_thread() {
 		ptr_barrier.init_thread(std::this_thread::get_id());
 	}
 
 };
 
+
+template<typename t>
 struct accessor {
-	using t = int;
-	//template<typename t>
+	
 	t& operator()(void* info) {
 		return *(t*)((mt_mempool::inst_info*)info)->ptr;
 	}
@@ -644,15 +644,15 @@ namespace mt_mem {
 
 		pool.init_thread();
 
-		accessor acc;
+		accessor<int> acc;
 
 		constexpr size_t object_count = 500;
 
-		std::vector<decltype(pool.construct())> objs;
+		std::vector<decltype(pool.construct<int>())> objs;
 
 		for (size_t i = 0; i < object_count; i++)
 		{
-			objs.emplace_back(pool.construct());
+			objs.emplace_back(pool.construct<int>());
 			acc(objs.back().get()) = static_cast<int>(i);
 		}
 
@@ -711,7 +711,7 @@ namespace mt_mem {
 		mt_mempool pool;
 		pool.init_thread();
 
-		auto p = pool.construct();
+		auto p = pool.construct<int>();
 
 		assert(p.get() != nullptr);
 		assert(**p == 0);
@@ -724,7 +724,7 @@ namespace mt_mem {
 		mt_mempool pool;
 		pool.init_thread();
 
-		auto p = pool.construct();
+		auto p = pool.construct<int>();
 
 		**p = 12345;
 
@@ -738,11 +738,11 @@ namespace mt_mem {
 		mt_mempool pool;
 		pool.init_thread();
 
-		std::vector<decltype(pool.construct())> arr;
+		std::vector<decltype(pool.construct<int>())> arr;
 
 		for (int i = 0; i < 100; i++)
 		{
-			arr.emplace_back(pool.construct());
+			arr.emplace_back(pool.construct<int>());
 			**arr.back() = i;
 		}
 
@@ -759,7 +759,7 @@ namespace mt_mem {
 		mt_mempool pool;
 		pool.init_thread();
 
-		auto p = pool.construct(16);
+		auto p = pool.construct<int>(16);
 
 		for (int i = 0; i < 16; i++)
 			(*p.get())[i] = i;
@@ -775,11 +775,11 @@ namespace mt_mem {
 		mt_mempool pool;
 		pool.init_thread();
 
-		std::vector<decltype(pool.construct())> arr;
+		std::vector<decltype(pool.construct<int>())> arr;
 
 		for (int i = 0; i < 100; i++)
 		{
-			arr.emplace_back(pool.construct());
+			arr.emplace_back(pool.construct<int>());
 			**arr.back() = i;
 		}
 
@@ -797,11 +797,11 @@ namespace mt_mem {
 		mt_mempool pool;
 		pool.init_thread();
 
-		std::vector<decltype(pool.construct())> arr;
+		std::vector<decltype(pool.construct<int>())> arr;
 
 		for (int i = 0; i < 100; i++)
 		{
-			arr.emplace_back(pool.construct());
+			arr.emplace_back(pool.construct<int>());
 			**arr.back() = i;
 		}
 

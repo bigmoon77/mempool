@@ -333,6 +333,9 @@ int test_pool() {
 
 #include "mempool.h" // mem::anytype_pool を定義したヘッダ
 
+
+#include "mt_mempool.h"
+
 // ------------------------------------------------------------
 // ベンチ対象オブジェクト
 // ------------------------------------------------------------
@@ -691,24 +694,165 @@ void benchmark_monotonic_pool(
         << " bytes\n";
 }
 
+//template<typename pool_t>
+void benchmark_mt_mempool(
+    size_t object_count,
+    size_t loop_count
+)
+{
+    std::cout << "\n===== mt_mempool =====\n";
 
-#include "mt_mempool.h"
+    mt_mempool pool;
+    pool.init_thread();
 
+    accessor<test_object> acc;
+
+    //--------------------------------------------
+    // construct + destruct
+    //--------------------------------------------
+    {
+        scoped_timer timer("construct + destruct");
+
+        for (size_t loop = 0; loop < loop_count; loop++)
+        {
+            std::vector<decltype(pool.construct<test_object>())> ptrs;
+            ptrs.reserve(object_count);
+
+            for (size_t i = 0; i < object_count; i++)
+            {
+                ptrs.emplace_back(pool.construct<test_object>());
+            }
+
+            ptrs.clear();
+        }
+    }
+
+    //--------------------------------------------
+    // construct only
+    //--------------------------------------------
+    {
+        scoped_timer timer("construct only");
+
+        std::vector<decltype(pool.construct<test_object>())> ptrs;
+        ptrs.reserve(object_count);
+
+        for (size_t i = 0; i < object_count; i++)
+        {
+            ptrs.emplace_back(pool.construct<test_object>());
+        }
+    }
+
+    //--------------------------------------------
+    // GC
+    //--------------------------------------------
+    {
+        std::vector<decltype(pool.construct<test_object>())> ptrs;
+
+        for (size_t i = 0; i < object_count; i++)
+            ptrs.emplace_back(pool.construct<test_object>());
+
+        scoped_timer timer("gc");
+
+        for (auto& chunk : pool.chunk_arr)
+            chunk->gc();
+    }
+
+    //--------------------------------------------
+    // GC + accessor
+    //--------------------------------------------
+    {
+        std::vector<decltype(pool.construct<test_object>())> ptrs;
+
+        for (size_t i = 0; i < object_count; i++)
+        {
+            ptrs.emplace_back(pool.construct<test_object>());
+            acc(ptrs.back().get()).buffer[0] = 'a';
+
+        }
+
+        scoped_timer timer("gc + accessor");
+
+        for (auto& chunk : pool.chunk_arr)
+            chunk->gc();
+
+        for (size_t i = 0; i < object_count; i++)
+        {
+            acc.lock(ptrs[i]);
+
+            volatile int x = acc(ptrs[i].get()).buffer[0];
+
+            (void)x;
+
+            acc.unlock(ptrs[i]);
+        }
+    }
+
+    std::cout
+        << "estimated raw memory : "
+        << estimate_memory_usage<int>(object_count)
+        << " bytes\n";
+}
+
+void benchmark_mt_gc_parallel(
+    size_t object_count,
+    size_t access_count
+)
+{
+    std::cout << "\n===== mt_mempool parallel =====\n";
+
+    mt_mempool pool;
+    pool.init_thread();
+
+    accessor<int> acc;
+
+    std::vector<decltype(pool.construct<int>())> ptrs;
+
+    ptrs.reserve(object_count);
+
+    for (size_t i = 0; i < object_count; i++)
+    {
+        ptrs.emplace_back(pool.construct<int>());
+        acc(ptrs.back().get()) = static_cast<int>(i);
+    }
+
+    bool finish = false;
+
+    std::thread gc([&]
+        {
+            pool.init_thread();
+
+            while (!finish)
+            {
+                for (auto& chunk : pool.chunk_arr)
+                    chunk->gc();
+            }
+        });
+
+    {
+        scoped_timer timer("parallel accessor");
+
+        for (size_t i = 0; i < access_count; i++)
+        {
+            auto& p = ptrs[i % object_count];
+
+            acc.lock(p);
+
+            ++acc(p.get());
+
+            acc.unlock(p);
+        }
+    }
+
+    finish = true;
+
+    gc.join();
+}
 int main() {
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
     
-
-
-    {
-        mt_mem::test_main();
-
-    }
-
-    
-    
-    return 0;
     test_pool();
-        
+    mt_mem::test_main();
+
 
 
     {
@@ -730,6 +874,14 @@ int main() {
             << "loop count : "
             << loop_count
             << "\n";
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        benchmark_mt_gc_parallel(object_count, loop_count);
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        benchmark_mt_mempool(object_count, loop_count);
+
+
         std::this_thread::sleep_for(std::chrono::seconds(1));
         benchmark_new_delete(
             object_count,
