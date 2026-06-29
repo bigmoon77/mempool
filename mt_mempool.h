@@ -171,8 +171,9 @@ struct mt_mempool {
 
 		bool allocateable(size_t size,size_t align) const {
 			std::lock_guard lock(allo_deallo_mtx);
-			return (back_ind + ((uintptr_t)&data[back_ind] % align)) +
-				(sizeof(inst_info) * inst_ind) <= max_ind;
+			return (back_ind + ((uintptr_t)&data[back_ind] % align)) + size < (max_ind - (sizeof(inst_info) * 
+				(inst_ind + 1)//これから追加するインスタンス情報分
+				));
 		}
 
 
@@ -297,18 +298,90 @@ struct mt_mempool {
 
 			//非同期フェーズ
 #pragma region
-			for (size_t i = 0; i < temp_inst_ind; i++)
-			{
-				if (i != temp_wait_inst_index_arr[wait_ind]) {
+			if (temp_wait_inst_index_arr.size()) {
 
-					inst_info* inst_ptr = (inst_tail - i);
 
-					ptr_barrier.lock(inst_ptr);
+				for (size_t i = 0; i < temp_inst_ind; i++)
+				{
+					if (i != temp_wait_inst_index_arr[wait_ind]) {
+
+						inst_info* inst_ptr = (inst_tail - i);
+
+						ptr_barrier.lock(inst_ptr);
+						if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
+							continue;
+						}
+						ptr_barrier.unlock();
+
+
+
+						const type_info* type;
+
+						{
+							std::lock_guard tmap_lock(tmap_mtx);
+							type = &(*tmap.find({ inst_ptr->tid,nullptr }));
+						}
+
+
+
+						auto preview_loc = inst_ptr->ptr;
+						inst_ptr->ptr = next_ptr;//new loc
+
+						//アラインメント考慮は関数が行う
+						//帰り値は次のptr
+						next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+					}
+					else {
+						if (temp_wait_inst_index_arr.size() == ++wait_ind) {
+							//以降はwaitがないことが確定しているのでif無しloopに飛ばす
+
+							for (size_t j = i + 1; j < temp_inst_ind; j++)
+							{
+								inst_info* inst_ptr = (inst_tail - j);
+
+
+								ptr_barrier.lock((char*)inst_ptr);
+								if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
+									continue;
+								}
+								ptr_barrier.unlock();
+
+
+								const type_info* type;
+
+								{
+									std::lock_guard tmap_lock(tmap_mtx);
+									type = &(*tmap.find({ inst_ptr->tid,nullptr }));
+								}
+
+								auto preview_loc = inst_ptr->ptr;
+								inst_ptr->ptr = next_ptr;//new loc
+
+								//アラインメント考慮は関数が行う
+								//帰り値は次のptr
+								next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+							}
+
+
+							break;
+						}
+						continue;
+					}
+				}
+
+
+			}
+			else {
+				//wait無しの場合はif無しloop
+
+				for (size_t j = 0; j < temp_inst_ind; j++)
+				{
+					inst_info* inst_ptr = (inst_tail - j);
+					ptr_barrier.lock((char*)inst_ptr);
 					if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
 						continue;
 					}
 					ptr_barrier.unlock();
-
 
 
 					const type_info* type;
@@ -318,8 +391,6 @@ struct mt_mempool {
 						type = &(*tmap.find({ inst_ptr->tid,nullptr }));
 					}
 
-
-
 					auto preview_loc = inst_ptr->ptr;
 					inst_ptr->ptr = next_ptr;//new loc
 
@@ -327,42 +398,9 @@ struct mt_mempool {
 					//帰り値は次のptr
 					next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
 				}
-				else {
-					if (temp_wait_inst_index_arr.size() == ++wait_ind) {
-						//以降はwaitがないことが確定しているのでif無しloopに飛ばす
-
-						for (size_t j = i + 1; j < temp_inst_ind; j++)
-						{
-							inst_info* inst_ptr = (inst_tail - j);
 
 
-							ptr_barrier.lock((char*)inst_ptr);
-							if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
-								continue;
-							}
-							ptr_barrier.unlock();
 
-
-							const type_info* type;
-
-							{
-								std::lock_guard tmap_lock(tmap_mtx);
-								type = &(*tmap.find({ inst_ptr->tid,nullptr }));
-							}
-
-							auto preview_loc = inst_ptr->ptr;
-							inst_ptr->ptr = next_ptr;//new loc
-
-							//アラインメント考慮は関数が行う
-							//帰り値は次のptr
-							next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
-						}
-
-
-						break;
-					}
-					continue;
-				}
 			}
 
 #pragma endregion
@@ -514,11 +552,19 @@ struct mt_mempool {
 		allocator* owner = nullptr;
 		for (auto& chunk: chunk_arr)
 		{
-			if (chunk->allocateable(sizeof(t), alignof(t))) {
+			if (chunk->allocateable(sizeof(t) * size, alignof(t))) {
 				ptr = reinterpret_cast<t*>(chunk->allocate(sizeof(t) * size, alignof(t)));
 				owner = chunk.get();
 				break;
 			}
+		}
+
+		if (!ptr) {
+			last_size *= 2;
+			last_size += sizeof(t) * size;
+
+			owner = chunk_arr.emplace_back(std::make_unique<allocator>(ptr_barrier, last_size)).get();
+			ptr = reinterpret_cast<t*>(owner->allocate(sizeof(t) * size, alignof(t)));
 		}
 
 		//construct
@@ -537,15 +583,13 @@ struct mt_mempool {
 		ptr_barrier.init_thread(std::this_thread::get_id());
 	}
 
-
-
 };
 
 struct accessor {
 	using t = int;
 	//template<typename t>
-	t& operator()(t* info) {
-		*(t*)((mt_mempool::inst_info*)(char*)info)->ptr;
+	t& operator()(void* info) {
+		return *(t*)((mt_mempool::inst_info*)info)->ptr;
 	}
 
 	void lock(std::unique_ptr<t,mt_mempool::inst_deleter<t>>& ptr) {
@@ -556,3 +600,147 @@ struct accessor {
 		ptr.get_deleter().owner->ptr_barrier.unlock();
 	}
 };
+
+
+
+
+
+#include <cassert>
+#include <iostream>
+#include <vector>
+
+#include "mt_mempool.h"
+
+
+namespace mt_mem {
+
+
+	inline void test_construct()
+	{
+		std::cout << "test_construct\n";
+
+		mt_mempool pool;
+		pool.init_thread();
+
+		auto p = pool.construct();
+
+		assert(p.get() != nullptr);
+		assert(**p == 0);
+	}
+
+	inline void test_write()
+	{
+		std::cout << "test_write\n";
+
+		mt_mempool pool;
+		pool.init_thread();
+
+		auto p = pool.construct();
+
+		**p = 12345;
+
+		assert(**p == 12345);
+	}
+
+	inline void test_multi_construct()
+	{
+		std::cout << "test_multi_construct\n";
+
+		mt_mempool pool;
+		pool.init_thread();
+
+		std::vector<decltype(pool.construct())> arr;
+
+		for (int i = 0; i < 100; i++)
+		{
+			arr.emplace_back(pool.construct());
+			**arr.back() = i;
+		}
+
+		for (int i = 0; i < 100; i++)
+		{
+			assert(**arr[i] == i);
+		}
+	}
+
+	inline void test_array()
+	{
+		std::cout << "test_array\n";
+
+		mt_mempool pool;
+		pool.init_thread();
+
+		auto p = pool.construct(16);
+
+		for (int i = 0; i < 16; i++)
+			(*p.get())[i] = i;
+
+		for (int i = 0; i < 16; i++)
+			assert((*p.get())[i] == i);
+	}
+
+	inline void test_gc()
+	{
+		std::cout << "test_gc\n";
+
+		mt_mempool pool;
+		pool.init_thread();
+
+		std::vector<decltype(pool.construct())> arr;
+
+		for (int i = 0; i < 100; i++)
+		{
+			arr.emplace_back(pool.construct());
+			**arr.back() = i;
+		}
+
+		for (auto& c : pool.chunk_arr)
+			c->gc();
+
+		for (int i = 0; i < 100; i++)
+			assert(**arr[i] == i);
+	}
+
+	inline void test_delete_gc()
+	{
+		std::cout << "test_delete_gc\n";
+
+		mt_mempool pool;
+		pool.init_thread();
+
+		std::vector<decltype(pool.construct())> arr;
+
+		for (int i = 0; i < 100; i++)
+		{
+			arr.emplace_back(pool.construct());
+			**arr.back() = i;
+		}
+
+		for (int i = 0; i < 100; i += 2)
+			arr[i].reset();
+
+		for (auto& c : pool.chunk_arr)
+			c->gc();
+
+		for (int i = 1; i < 100; i += 2)
+		{
+			assert(arr[i]);
+			assert(**arr[i] == i);
+		}
+	}
+
+	int test_main()
+	{
+		test_construct();
+		test_write();
+		test_multi_construct();
+		test_array();
+		test_gc();
+		test_delete_gc();
+
+		std::cout << "\n===== ALL TEST PASSED =====\n";
+
+		return 0;
+	}
+
+}
