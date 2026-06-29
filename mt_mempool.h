@@ -20,13 +20,19 @@ struct mt_mempool {
 			std::shared_mutex mtx;
 		};
 
+		std::mutex mtx;
 		std::map<std::thread::id, pointer_info> vals;
 		
 		void init_thread(std::thread::id id) {
+
+			std::lock_guard lock(mtx);
 			vals[id].loc = nullptr;
 		}
 
 		void lock(void* ptr) {
+
+			std::lock_guard lock(mtx);
+
 			auto this_id = std::this_thread::get_id();
 			bool loop;
 
@@ -46,6 +52,20 @@ struct mt_mempool {
 
 				//全ての値にロックを取得しており変更される可能性がない
 				//かつ　全ての値がロック対象の値と違う場合、ロックを実行する
+
+				/*
+				デッドロック問題
+
+				A、Bを同時に取得する時、それぞれスレッドにshared lock,lockを獲得する
+				この時
+
+				Aがshared lock,Bがlockを自身に
+				Bがshared lock,Aがlockに自身に取得し譲らない
+				lock取得には優先度をつける必要がある
+
+				ひとまずmtxでの解決をする
+
+				*/
 
 				if (!loop) {
 					auto& target = vals[this_id];
@@ -592,11 +612,11 @@ struct accessor {
 		return *(t*)((mt_mempool::inst_info*)info)->ptr;
 	}
 
-	void lock(std::unique_ptr<t,mt_mempool::inst_deleter<t>>& ptr) {
+	void lock(const std::unique_ptr<t*,mt_mempool::inst_deleter<t>>& ptr) {
 		ptr.get_deleter().owner->ptr_barrier.lock(ptr.get());
 	}
 
-	void unlock(std::unique_ptr<t, mt_mempool::inst_deleter<t>>& ptr) {
+	void unlock(const std::unique_ptr<t*, mt_mempool::inst_deleter<t>>& ptr) {
 		ptr.get_deleter().owner->ptr_barrier.unlock();
 	}
 };
@@ -608,12 +628,81 @@ struct accessor {
 #include <cassert>
 #include <iostream>
 #include <vector>
-
-#include "mt_mempool.h"
-
+#include <cassert>
+#include <chrono>
+#include <random>
+#include <thread>
 
 namespace mt_mem {
 
+
+	inline void test_gc_multithread()
+	{
+		std::cout << "test_gc_multithread\n";
+
+		mt_mempool pool;
+
+		pool.init_thread();
+
+		accessor acc;
+
+		constexpr size_t object_count = 500;
+
+		std::vector<decltype(pool.construct())> objs;
+
+		for (size_t i = 0; i < object_count; i++)
+		{
+			objs.emplace_back(pool.construct());
+			acc(objs.back().get()) = static_cast<int>(i);
+		}
+
+		bool finish = false;
+
+		//----------------------------------------------------------
+		// GCスレッド
+		//----------------------------------------------------------
+		std::thread gc_thread([&]
+			{
+				pool.init_thread();
+
+				while (!finish)
+				{
+					for (auto& chunk : pool.chunk_arr)
+						chunk->gc();
+
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				}
+			});
+
+		//----------------------------------------------------------
+		// メインスレッド
+		//----------------------------------------------------------
+		for (int loop = 0; loop < 5000; loop++)
+		{
+			for (size_t i = 0; i < object_count; i++)
+			{
+				//const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
+				//const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
+				acc.lock(objs[i]);
+
+				int& value = acc(objs[i].get());
+
+				assert(value == static_cast<int>(i));
+
+				value++;
+
+				value--;
+
+				acc.unlock(objs[i]);
+			}
+		}
+
+		finish = true;
+
+		gc_thread.join();
+
+		std::cout << "OK\n";
+	}
 
 	inline void test_construct()
 	{
@@ -737,6 +826,7 @@ namespace mt_mem {
 		test_array();
 		test_gc();
 		test_delete_gc();
+		test_gc_multithread();
 
 		std::cout << "\n===== ALL TEST PASSED =====\n";
 
