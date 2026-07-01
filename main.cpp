@@ -703,7 +703,6 @@ void benchmark_mt_mempool(
     std::cout << "\n===== mt_mempool =====\n";
 
     mt_mempool pool;
-    pool.init_thread();
 
     accessor<test_object> acc;
 
@@ -801,7 +800,6 @@ void benchmark_mt_gc_parallel(
     std::cout << "\n===== mt_mempool parallel =====\n";
 
     mt_mempool pool;
-    pool.init_thread();
 
     accessor<int> acc;
 
@@ -819,7 +817,7 @@ void benchmark_mt_gc_parallel(
 
     std::thread gc([&]
         {
-            pool.init_thread();
+            mempool_util::pointer_mutex::init_thread();
 
             while (!finish)
             {
@@ -847,12 +845,202 @@ void benchmark_mt_gc_parallel(
 
     gc.join();
 }
+
+
+
+#include <cassert>
+#include <iostream>
+#include <vector>
+#include <cassert>
+#include <chrono>
+#include <random>
+#include <thread>
+
+namespace mt_mem {
+
+
+    inline void test_gc_multithread()
+    {
+        std::cout << "test_gc_multithread\n";
+
+        mt_mempool pool;
+
+        accessor<int> acc;
+
+        constexpr size_t object_count = 500;
+
+        std::vector<decltype(pool.construct<int>())> objs;
+
+        for (size_t i = 0; i < object_count; i++)
+        {
+            objs.emplace_back(pool.construct<int>());
+            acc(objs.back().get()) = static_cast<int>(i);
+        }
+
+        bool finish = false;
+
+        //----------------------------------------------------------
+        // GCスレッド
+        //----------------------------------------------------------
+        std::thread gc_thread([&]
+            {
+                mempool_util::pointer_mutex::init_thread();
+
+                while (!finish)
+                {
+                    for (auto& chunk : pool.chunk_arr)
+                        chunk->gc();
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
+
+        //----------------------------------------------------------
+        // メインスレッド
+        //----------------------------------------------------------
+        for (int loop = 0; loop < 5000; loop++)
+        {
+            for (size_t i = 0; i < object_count; i++)
+            {
+                //const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
+                //const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
+                acc.lock(objs[i]);
+
+                int& value = acc(objs[i].get());
+                int* ptr = &value;
+
+                assert(value == static_cast<int>(i));
+
+                value++;
+
+                value--;
+
+                acc.unlock(objs[i]);
+            }
+        }
+
+        finish = true;
+
+        gc_thread.join();
+
+        std::cout << "OK\n";
+    }
+
+    inline void test_construct()
+    {
+        std::cout << "test_construct\n";
+
+        mt_mempool pool;
+
+        auto p = pool.construct<int>();
+
+        assert(p.get() != nullptr);
+        assert(**p == 0);
+    }
+
+    inline void test_write()
+    {
+        std::cout << "test_write\n";
+
+        mt_mempool pool;
+
+        auto p = pool.construct<int>();
+
+        **p = 12345;
+
+        assert(**p == 12345);
+    }
+
+    inline void test_multi_construct()
+    {
+        std::cout << "test_multi_construct\n";
+
+        mt_mempool pool;
+
+        std::vector<decltype(pool.construct<int>())> arr;
+
+        for (int i = 0; i < 100; i++)
+        {
+            arr.emplace_back(pool.construct<int>());
+            **arr.back() = i;
+        }
+
+        for (int i = 0; i < 100; i++)
+        {
+            assert(**arr[i] == i);
+        }
+    }
+
+    inline void test_gc()
+    {
+        std::cout << "test_gc\n";
+
+        mt_mempool pool;
+
+        std::vector<decltype(pool.construct<int>())> arr;
+
+        for (int i = 0; i < 100; i++)
+        {
+            arr.emplace_back(pool.construct<int>());
+            **arr.back() = i;
+        }
+
+        for (auto& c : pool.chunk_arr)
+            c->gc();
+
+        for (int i = 0; i < 100; i++)
+            assert(**arr[i] == i);
+    }
+
+    inline void test_delete_gc()
+    {
+        std::cout << "test_delete_gc\n";
+
+        mt_mempool pool;
+
+        std::vector<decltype(pool.construct<int>())> arr;
+
+        for (int i = 0; i < 100; i++)
+        {
+            arr.emplace_back(pool.construct<int>());
+            **arr.back() = i;
+        }
+
+        for (int i = 0; i < 100; i += 2)
+            arr[i].reset();
+
+        for (auto& c : pool.chunk_arr)
+            c->gc();
+
+        for (int i = 1; i < 100; i += 2)
+        {
+            assert(arr[i]);
+            assert(**arr[i] == i);
+        }
+    }
+
+    int test_main()
+    {
+        test_construct();
+        test_write();
+        test_multi_construct();
+        test_gc();
+        test_delete_gc();
+        test_gc_multithread();
+
+        std::cout << "\n===== ALL TEST PASSED =====\n";
+
+        return 0;
+    }
+
+}
 int main() {
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
-    
+
+
+    mempool_util::pointer_mutex::init_thread();
     test_pool();
     mt_mem::test_main();
-
 
 
     {

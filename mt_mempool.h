@@ -8,121 +8,151 @@
 #include <algorithm>
 #include <memory_resource>
 #include <map>
-
+#include <iostream>
+#include <iomanip>
 
 #include "error/located_exception.h"
 
+namespace mempool_util {
 
-struct mt_mempool {
-	struct pointer_barrier {
-		struct pointer_info {
-			void* loc;
-			std::shared_mutex mtx;
+
+	template<size_t i>
+	consteval size_t pow2() {
+		return 2 * pow2<i - 1>();
+	}
+
+	template<>
+	consteval size_t pow2<1>() {
+		return 2;
+	}
+
+	template<>
+	consteval size_t pow2<0>() {
+		return 1;
+	}
+
+	struct pointer_mutex {
+
+		static thread_local inline uint8_t current_tid = 1;
+		static inline std::atomic_uint8_t counter = 0;
+
+		struct entry {
+			std::atomic_uint8_t mtx = 0;
+
+			void lock() {
+
+				while (true)
+				{
+					uint8_t temp = 0;
+					if (mtx.compare_exchange_weak(temp, current_tid))
+						break;
+					mtx.wait(temp);
+				}
+
+			}
+
+			void unlock() {
+				mtx.store(0);
+				mtx.notify_one();
+			}
 		};
 
-		std::mutex mtx;
-		std::map<std::thread::id, pointer_info> vals;
-		
-		void init_thread(std::thread::id id) {
 
-			std::lock_guard lock(mtx);
-			vals[id].loc = nullptr;
+		static inline constexpr size_t size = mempool_util::pow2<10>();
+		static inline constexpr size_t mask = size - 1;
+
+		entry arr[size];
+
+		static inline size_t make_hash(void* ptr)noexcept {
+			return (uintptr_t)ptr << 4;
+		}
+
+		static void init_thread() {
+			current_tid = ++counter;
 		}
 
 		void lock(void* ptr) {
-			/*
-			現状ここが一番のオーバーヘッド　
-			ここを高速化しない限り話にならない
-			
-			*/
-
-			std::lock_guard lock(mtx);
-
-			auto this_id = std::this_thread::get_id();
-			bool loop;
-
-			do
-			{
-				loop = false;
-
-
-				for (auto& [k, v] : vals)
-				{
-					if (k == this_id)
-						continue;
-
-					v.mtx.lock_shared();
-					loop = loop || v.loc == ptr;
-				}
-
-				//全ての値にロックを取得しており変更される可能性がない
-				//かつ　全ての値がロック対象の値と違う場合、ロックを実行する
-
-				/*
-				デッドロック問題
-
-				A、Bを同時に取得する時、それぞれスレッドにshared lock,lockを獲得する
-				この時
-
-				Aがshared lock,Bがlockを自身に
-				Bがshared lock,Aがlockに自身に取得し譲らない
-				lock取得には優先度をつける必要がある
-
-				ひとまずmtxでの解決をする
-
-				*/
-
-				if (!loop) {
-					auto& target = vals[this_id];
-					std::lock_guard lock(target.mtx);
-					target.loc = ptr;
-				}
-
-				for (auto& [k,v] : vals)
-				{
-					if (k == this_id)
-						continue;
-					v.mtx.unlock_shared();
-				}
-
-			} while (loop);
-
+			arr[make_hash(ptr) & mask].lock();
 		}
-		void unlock() {
-			auto this_id = std::this_thread::get_id();
-			
-			auto& target = vals[this_id];
-			std::lock_guard lock(target.mtx);
-			target.loc = nullptr;
+		void unlock(void* ptr) {
+			arr[make_hash(ptr) & mask].unlock();
 		}
 	};
 
+
+	pointer_mutex& get_pointer_mutex();
+};
+
+
+
+
+struct mt_mempool {
+
+	class scoped_timer {
+		using clock = std::chrono::high_resolution_clock;
+
+		std::string _name;
+		clock::time_point _begin;
+
+	public:
+		scoped_timer(std::string name)
+			: _name(std::move(name)), _begin(clock::now()) {
+		}
+
+		~scoped_timer() {
+			auto end = clock::now();
+
+			auto ns =
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					end - _begin).count();
+
+			std::cout
+				<< std::setw(32)
+				<< std::left
+				<< _name
+				<< " : "
+				<< ns
+				<< " ns"
+				<< std::endl;
+		}
+	};
+
+
+	static constexpr size_t chunk_size = 144 * 100000;
+
 	struct type_info {
-		std::type_index tid = typeid(int);
+		std::type_index tid = typeid(void);
 		//dst,src
-		char* (*move)(char*&, char*,size_t) = nullptr;
+		char* (*move)(char*&, char*) = nullptr;
 
-
-		bool operator < (const type_info& other)const {
+		bool operator < (const type_info& other)const noexcept {
 			return tid < other.tid;
 		}
-		bool operator <= (const type_info& other)const {
+		bool operator > (const type_info& other)const noexcept {
+			return tid < other.tid;
+		}
+		bool operator <= (const type_info& other)const noexcept {
 			return tid <= other.tid;
 		}
-		bool operator == (const type_info& other)const {
+		bool operator >= (const type_info& other)const noexcept {
+			return tid >= other.tid;
+		}
+		bool operator == (const type_info& other)const noexcept {
 			return tid == other.tid;
+		}
+
+		bool operator != (const type_info& other)const noexcept {
+			return tid != other.tid;
 		}
 	};
 
 	struct inst_info {
 		char* ptr = nullptr;//オブジェクトが格納されたptrを指す
-		size_t array_size = 1;
-		std::type_index tid = typeid(int);
+		std::type_index tid = typeid(void);
 	};
 
 	struct allocator {
-		//type_map tmap;
-		pointer_barrier& ptr_barrier;
+		mempool_util::pointer_mutex* ptr_mtx;
 
 		mutable std::mutex allo_deallo_mtx;
 		mutable std::mutex tmap_mtx;
@@ -130,41 +160,33 @@ struct mt_mempool {
 
 		std::set<type_info> tmap;
 
-		std::unique_ptr<char[]> data;
-
+		
+		std::vector<size_t> wait_inst_index_arr;
+		//gc中に追加されたオブジェクト
+		std::vector<size_t> gc_make_inst;
 		//次オブジェクトを作成する際のindex
 		size_t back_ind = 0;
 
 		//次作成する際のinst_infoのindex
 		size_t inst_ind = 0;
-		
-	
-		//取りえる最大のindex
-		size_t max_ind = 0;
 
-		//破棄したオブジェクトの総サイズ
-		std::atomic_size_t dead_space = 0;
-		
-
-		std::vector<size_t> wait_inst_index_arr;
-
-		//gc中に追加されたオブジェクト
-		std::vector<size_t> gc_make_inst;
-		
 		bool gc_now = false;
 
+		char data[chunk_size];
 
-		allocator(pointer_barrier& ptr_barrier,size_t size)
-			: ptr_barrier(ptr_barrier),
-			data(std::make_unique_for_overwrite<char[]>(size)),
-			max_ind(size) {
+		
+
+		allocator() {
+			ptr_mtx = &mempool_util::get_pointer_mutex();
+			gc_make_inst.reserve(chunk_size / 16);
+			wait_inst_index_arr.reserve(chunk_size / 16);
 		}
 
 		~allocator() {
 
 #ifdef _DEBUG
 			
-			auto tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
+			auto tail = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]);
 			size_t j = 0;
 			for (size_t i = 0; i < inst_ind; i++)
 			{
@@ -190,13 +212,9 @@ struct mt_mempool {
 			return res;
 		}
 
-		void deallocate(const char* block,size_t size, size_t align) {
-			dead_space += size;
-		}
-
 		bool allocateable(size_t size,size_t align) const {
 			std::lock_guard lock(allo_deallo_mtx);
-			return (back_ind + ((uintptr_t)&data[back_ind] % align)) + size < (max_ind - (sizeof(inst_info) * 
+			return (back_ind + ((uintptr_t)&data[back_ind] % align)) + size < (chunk_size - (sizeof(inst_info) * 
 				(inst_ind + 1)//これから追加するインスタンス情報分
 				));
 		}
@@ -204,61 +222,55 @@ struct mt_mempool {
 
 		//オブジェクトへのコンストラクタは呼ばない
 		template<typename t>
-		inst_info* make_inst(char* ptr,size_t array_size,std::type_index tid) {
+		inst_info* make_inst(char* ptr) {
 			
 			inst_info* info_ptr;
 
 			{
-				std::lock_guard lock(wait_inst_mtx);
-
-				if (wait_inst_index_arr.empty())
-					info_ptr = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]) -
-					(inst_ind++);
+				//std::lock_guard lock(wait_inst_mtx);
+				wait_inst_mtx.lock();
+				if (wait_inst_index_arr.empty()) {
+					info_ptr = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -
+						(inst_ind++);
+				}
 				else {
-					info_ptr = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]) -
+					info_ptr = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -
 						wait_inst_index_arr.back();
 					wait_inst_index_arr.pop_back();
 				}
+				wait_inst_mtx.unlock();
+			}
 
-
-				if (gc_now) {
-
-					gc_make_inst.emplace_back(//gc中に生成された物ならばindexを記録
-						static_cast<size_t>(
-							(
-								inst_info*)&data[max_ind - sizeof(inst_info)] - info_ptr
-							)
-					);
-				}
-
+			if (gc_now) {
+				gc_make_inst.emplace_back(//gc中に生成された物ならばindexを記録
+					static_cast<size_t>(
+						(
+							inst_info*)&data[chunk_size - sizeof(inst_info)] - info_ptr
+						)
+				);
 			}
 
 
-
+			
 			{//型追加
-				type_info temp;
-				temp.tid = tid;
-				temp.move = &move<t>;
-
-				std::lock_guard lock(tmap_mtx);
-				tmap.emplace(temp);
+				//std::lock_guard lock();
+				tmap_mtx.lock();
+				tmap.emplace(typeid(t),&move<t>);
+				tmap_mtx.unlock();
 			}
 
 
 			{
-				scoped_timer get_lock("ptr lock");
-
-				ptr_barrier.lock(info_ptr);
+				ptr_mtx->lock(info_ptr);
 
 				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
 					new (info_ptr) inst_info();
 				}
 
 				info_ptr->ptr = ptr;//info更新　この時点でデストラクタは呼ばれている必要がある
-				info_ptr->array_size = array_size;
-				info_ptr->tid = tid;
-				
-				ptr_barrier.unlock();
+				info_ptr->tid = typeid(t);
+
+				ptr_mtx->unlock(info_ptr);
 			}
 
 			return info_ptr;
@@ -271,20 +283,21 @@ struct mt_mempool {
 			//gcが終わるまで待機
 
 			{
-				ptr_barrier.lock(ptr);
+
+
+				ptr_mtx->lock(ptr);
 
 				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
 					ptr->~inst_info();
 				}
 
-				ptr->array_size = static_cast<size_t>(-1);//破棄フラグ
-
-				ptr_barrier.unlock();
+				ptr->tid = typeid(void);
+				ptr_mtx->unlock(ptr);
 			}
 
 			auto wait_ind = 
 				static_cast<size_t>(
-					reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]) -//最後尾のptr
+					reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -//最後尾のptr
 					ptr
 				);
 
@@ -302,14 +315,23 @@ struct mt_mempool {
 
 		void gc() {
 
-			auto next_ptr = data.get();
+			auto next_ptr = data;// .get();
 
 			size_t wait_ind = 0;//wait_ind[wait_ind]の部分は飛ばして読む
 			
 
 			//ダブルバッファリング
 			std::vector<size_t> temp_wait_inst_index_arr;
+			std::set<type_info> tmap;
+
+			{
+				std::lock_guard tmap_lock(tmap_mtx);
+				tmap = this->tmap;
+			}
+			
 			size_t temp_inst_ind;
+			
+			
 			{
 				std::lock_guard lock(wait_inst_mtx);
 				temp_wait_inst_index_arr = wait_inst_index_arr;
@@ -361,7 +383,7 @@ struct mt_mempool {
 
 				//最後尾のinst_info
 				//ケツから確保しているので注意
-				auto inst_tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
+				auto inst_tail = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]);
 
 				std::sort(inst_ind_arr.begin(), inst_ind_arr.end(),
 					[&inst_tail](const size_t& l, const size_t& r) {
@@ -375,29 +397,19 @@ struct mt_mempool {
 				{
 					inst_info* inst_ptr = (inst_tail - i);
 
-					ptr_barrier.lock(inst_ptr);
-					if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
+					ptr_mtx->lock(inst_ptr);
+					if (inst_ptr->tid == typeid(void)) {//途中で破棄された
+						ptr_mtx->unlock(inst_ptr);
 						continue;
 					}
-					ptr_barrier.unlock();
-
-
-
-					const type_info* type;
-
-					{
-						std::lock_guard tmap_lock(tmap_mtx);
-						type = &(*tmap.find({ inst_ptr->tid,nullptr }));
-					}
-
-
 
 					auto preview_loc = inst_ptr->ptr;
 					inst_ptr->ptr = next_ptr;//new loc
 
-					//アラインメント考慮は関数が行う
-					//帰り値は次のptr
-					next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+					next_ptr = tmap.find({ inst_ptr->tid,nullptr })->move(inst_ptr->ptr, preview_loc);
+
+					ptr_mtx->unlock(inst_ptr);
+
 				}
 			}
 
@@ -411,7 +423,7 @@ struct mt_mempool {
 			{
 				//最後尾のinst_info
 				//ケツから確保しているので注意
-				auto inst_tail = reinterpret_cast<inst_info*>(&data[max_ind - sizeof(inst_info)]);
+				auto inst_tail = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]);
 
 				//backindの固定に必要
 				std::lock_guard allo_lock(allo_deallo_mtx);
@@ -423,12 +435,12 @@ struct mt_mempool {
 					inst_info* inst_ptr = (inst_tail - i);
 
 
-					ptr_barrier.lock(inst_ptr);
-					if (inst_ptr->array_size == static_cast<size_t>(-1)) {//途中で破棄された
+
+					ptr_mtx->lock(inst_ptr); 
+					if (inst_ptr->tid == typeid(void)) {//途中で破棄された
+						ptr_mtx->unlock(inst_ptr);
 						continue;
 					}
-					ptr_barrier.unlock();
-
 
 					auto type = tmap.find({ inst_ptr->tid,nullptr });
 
@@ -437,10 +449,13 @@ struct mt_mempool {
 
 					//アラインメント考慮は関数が行う
 					//帰り値は次のptr
-					next_ptr = type->move(inst_ptr->ptr, preview_loc, inst_ptr->array_size);
+					next_ptr = type->move(inst_ptr->ptr, preview_loc);
+
+					ptr_mtx->unlock(inst_ptr);
+
 				}
 
-				back_ind = static_cast<size_t>(next_ptr - data.get());
+				back_ind = static_cast<size_t>(next_ptr - data);
 
 				std::lock_guard wait_lock(wait_inst_mtx);
 				gc_now = false;
@@ -463,17 +478,10 @@ struct mt_mempool {
 		void operator()(void* block)const {
 			static_assert(std::is_standard_layout_v<inst_info>, "ポインタ変換が行えない環境");
 
-			auto info = reinterpret_cast<inst_info*>(block);
-
 			if constexpr (!std::is_trivially_copyable_v<t>) {//トリビアル型以外はデストラクト	
-				for (size_t i = 0; i < info->array_size; i++)
-				{
-					reinterpret_cast<t*>(info->ptr)[i].~t();
-				}
+				reinterpret_cast<t*>(reinterpret_cast<inst_info*>(block)->ptr)->~t();
 			}
-
-			owner->deallocate(info->ptr, sizeof(t), alignof(t));
-			owner->erase_inst(info);
+			owner->erase_inst(reinterpret_cast<inst_info*>(block));
 		}
 	};
 
@@ -490,7 +498,7 @@ struct mt_mempool {
 	/// <param name="size"></param>
 	/// <returns></returns>
 	template<typename t>
-	static char* move(char*& dst,char* src,size_t size) {
+	static char* move(char*& dst,char* src) {
 
 		dst += ((uintptr_t)dst % alignof(t));//アラインメント詰めのアドレスにする
 
@@ -503,140 +511,74 @@ struct mt_mempool {
 				throw error::located_exception("fetal error invalid object move");
 			}
 #endif
-
 			//アドレス距離がオブジェクトのサイズ未満だった場合、移動先と移動元は重なっている
 
 			if ((dst - src) < sizeof(t)) {//間が１要素以上あるならば問題はない為この境界
 
-				for (size_t i = 0; i < size; i++)
-				{
-					t temp(std::move(
-						*reinterpret_cast<t*>(src)
-					));
-
-					reinterpret_cast<t*>(src)[i].~t();
-
-					new (&reinterpret_cast<t*>(dst)[i]) t(std::move(temp));
-				}
+				t temp(std::move(
+					*reinterpret_cast<t*>(src)
+				));
+				reinterpret_cast<t*>(src)->~t();
+				new (reinterpret_cast<t*>(dst)) t(std::move(temp));
 			}
 			else {
-
-				for (size_t i = 0; i < size; i++)
-				{
-					new (&reinterpret_cast<t*>(dst)[i]) t(
-						std::move(
-							reinterpret_cast<t*>(src)[i]
-						)
-					);
-					reinterpret_cast<t*>(src)[i].~t();
-				}
+				new (reinterpret_cast<t*>(dst)) t(
+					std::move(*reinterpret_cast<t*>(src))
+				);
+				reinterpret_cast<t*>(src)->~t();
 			}
-
 		}
-
-
-		return dst + (sizeof(t) * size);
+		return dst + sizeof(t);
 	}
 
-	pointer_barrier ptr_barrier;
+	std::mutex mtx;
 	std::vector<std::unique_ptr<allocator>> chunk_arr;
 
-	size_t last_size = 100000;
-	
 	mt_mempool() {
 
 		if (chunk_arr.empty()) {
-			last_size *= 2;
-			chunk_arr.emplace_back(std::make_unique<allocator>(ptr_barrier, last_size));
+			chunk_arr.emplace_back(std::make_unique<allocator>());
 		}
 	}
 
-	class scoped_timer {
-		using clock = std::chrono::high_resolution_clock;
-
-		std::string _name;
-		clock::time_point _begin;
-
-	public:
-		scoped_timer(std::string name)
-			: _name(std::move(name)), _begin(clock::now()) {
-		}
-
-		~scoped_timer() {
-			auto end = clock::now();
-
-			auto ns =
-				std::chrono::duration_cast<std::chrono::nanoseconds>(
-					end - _begin).count();
-
-			std::cout
-				<< std::setw(32)
-				<< std::left
-				<< _name
-				<< " : "
-				<< ns
-				<< " ns"
-				<< std::endl;
-		}
-	};
 
 	template<typename t>
-	std::unique_ptr<t*,inst_deleter<t>> construct(size_t size = 1) {
-
-		
-		t* ptr = nullptr;
-		allocator* owner = nullptr;
+	std::unique_ptr<t*,inst_deleter<t>> construct() {
 
 		{
-			scoped_timer timer("find_chunk");
-
+			
+			std::lock_guard lock(mtx);
 			for (auto& chunk : chunk_arr)
 			{
-				if (chunk->allocateable(sizeof(t) * size, alignof(t))) {
+				if (chunk->allocateable(sizeof(t), alignof(t))) {
+					
+					allocator* owner = chunk.get();
 
-
-					{
-						//scoped_timer timer("allocate");
-
-						ptr = reinterpret_cast<t*>(chunk->allocate(sizeof(t) * size, alignof(t)));
-					}
-
-
-					owner = chunk.get();
-					break;
+					return std::unique_ptr<t*, inst_deleter<t>>(
+						(t**)(char*)owner->make_inst<t>(
+							(char*)new (reinterpret_cast<t*>(chunk->allocate(sizeof(t), alignof(t))))t()),
+						inst_deleter<t>(owner)
+					);
 				}
 			}
 		}
 
-		if (!ptr) {
-			last_size *= 2;
-			last_size += sizeof(t) * size;
-
-			owner = chunk_arr.emplace_back(std::make_unique<allocator>(ptr_barrier, last_size)).get();
-			ptr = reinterpret_cast<t*>(owner->allocate(sizeof(t) * size, alignof(t)));
-		}
-
-		//construct
-		for (size_t i = 0; i < size; i++)
 		{
-			new (&ptr[i])t();
+			//scoped_timer timer("emplace construct");
+
+
+			allocator* owner = chunk_arr.emplace_back(std::make_unique<allocator>()).get();
+
+			return std::unique_ptr<t*, inst_deleter<t>>(
+				(t**)(char*)owner->make_inst<t>((char*)
+					new (
+						reinterpret_cast<t*>(owner->allocate(sizeof(t), alignof(t)))
+						)t()
+				),
+				inst_deleter<t>(owner)
+			);
 		}
-
-		inst_info* info_ptr;
-		{
-			scoped_timer timer("make_inst");
-
-			info_ptr = owner->make_inst<t>((char*)ptr, size, typeid(t));
-		}
-
-
-		return std::unique_ptr<t*, inst_deleter<t>>((t**)(char*)info_ptr, inst_deleter<t>(owner));
 	}
-
-	void init_thread() {
-		ptr_barrier.init_thread(std::this_thread::get_id());
-	}
-
 };
 
 
@@ -648,224 +590,14 @@ struct accessor {
 	}
 
 	void lock(const std::unique_ptr<t*,mt_mempool::inst_deleter<t>>& ptr) {
-		ptr.get_deleter().owner->ptr_barrier.lock(ptr.get());
+		mempool_util::get_pointer_mutex().lock(ptr.get());
 	}
 
 	void unlock(const std::unique_ptr<t*, mt_mempool::inst_deleter<t>>& ptr) {
-		ptr.get_deleter().owner->ptr_barrier.unlock();
+		mempool_util::get_pointer_mutex().unlock(ptr.get());
 	}
 };
 
 
 
 
-
-#include <cassert>
-#include <iostream>
-#include <vector>
-#include <cassert>
-#include <chrono>
-#include <random>
-#include <thread>
-
-namespace mt_mem {
-
-
-	inline void test_gc_multithread()
-	{
-		std::cout << "test_gc_multithread\n";
-
-		mt_mempool pool;
-
-		pool.init_thread();
-
-		accessor<int> acc;
-
-		constexpr size_t object_count = 500;
-
-		std::vector<decltype(pool.construct<int>())> objs;
-
-		for (size_t i = 0; i < object_count; i++)
-		{
-			objs.emplace_back(pool.construct<int>());
-			acc(objs.back().get()) = static_cast<int>(i);
-		}
-
-		bool finish = false;
-
-		//----------------------------------------------------------
-		// GCスレッド
-		//----------------------------------------------------------
-		std::thread gc_thread([&]
-			{
-				pool.init_thread();
-
-				while (!finish)
-				{
-					for (auto& chunk : pool.chunk_arr)
-						chunk->gc();
-
-					std::this_thread::sleep_for(std::chrono::milliseconds(1));
-				}
-			});
-
-		//----------------------------------------------------------
-		// メインスレッド
-		//----------------------------------------------------------
-		for (int loop = 0; loop < 5000; loop++)
-		{
-			for (size_t i = 0; i < object_count; i++)
-			{
-				//const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
-				//const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
-				acc.lock(objs[i]);
-
-				int& value = acc(objs[i].get());
-
-				assert(value == static_cast<int>(i));
-
-				value++;
-
-				value--;
-
-				acc.unlock(objs[i]);
-			}
-		}
-
-		finish = true;
-
-		gc_thread.join();
-
-		std::cout << "OK\n";
-	}
-
-	inline void test_construct()
-	{
-		std::cout << "test_construct\n";
-
-		mt_mempool pool;
-		pool.init_thread();
-
-		auto p = pool.construct<int>();
-
-		assert(p.get() != nullptr);
-		assert(**p == 0);
-	}
-
-	inline void test_write()
-	{
-		std::cout << "test_write\n";
-
-		mt_mempool pool;
-		pool.init_thread();
-
-		auto p = pool.construct<int>();
-
-		**p = 12345;
-
-		assert(**p == 12345);
-	}
-
-	inline void test_multi_construct()
-	{
-		std::cout << "test_multi_construct\n";
-
-		mt_mempool pool;
-		pool.init_thread();
-
-		std::vector<decltype(pool.construct<int>())> arr;
-
-		for (int i = 0; i < 100; i++)
-		{
-			arr.emplace_back(pool.construct<int>());
-			**arr.back() = i;
-		}
-
-		for (int i = 0; i < 100; i++)
-		{
-			assert(**arr[i] == i);
-		}
-	}
-
-	inline void test_array()
-	{
-		std::cout << "test_array\n";
-
-		mt_mempool pool;
-		pool.init_thread();
-
-		auto p = pool.construct<int>(16);
-
-		for (int i = 0; i < 16; i++)
-			(*p.get())[i] = i;
-
-		for (int i = 0; i < 16; i++)
-			assert((*p.get())[i] == i);
-	}
-
-	inline void test_gc()
-	{
-		std::cout << "test_gc\n";
-
-		mt_mempool pool;
-		pool.init_thread();
-
-		std::vector<decltype(pool.construct<int>())> arr;
-
-		for (int i = 0; i < 100; i++)
-		{
-			arr.emplace_back(pool.construct<int>());
-			**arr.back() = i;
-		}
-
-		for (auto& c : pool.chunk_arr)
-			c->gc();
-
-		for (int i = 0; i < 100; i++)
-			assert(**arr[i] == i);
-	}
-
-	inline void test_delete_gc()
-	{
-		std::cout << "test_delete_gc\n";
-
-		mt_mempool pool;
-		pool.init_thread();
-
-		std::vector<decltype(pool.construct<int>())> arr;
-
-		for (int i = 0; i < 100; i++)
-		{
-			arr.emplace_back(pool.construct<int>());
-			**arr.back() = i;
-		}
-
-		for (int i = 0; i < 100; i += 2)
-			arr[i].reset();
-
-		for (auto& c : pool.chunk_arr)
-			c->gc();
-
-		for (int i = 1; i < 100; i += 2)
-		{
-			assert(arr[i]);
-			assert(**arr[i] == i);
-		}
-	}
-
-	int test_main()
-	{
-		test_construct();
-		test_write();
-		test_multi_construct();
-		test_array();
-		test_gc();
-		test_delete_gc();
-		test_gc_multithread();
-
-		std::cout << "\n===== ALL TEST PASSED =====\n";
-
-		return 0;
-	}
-
-}

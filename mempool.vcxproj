@@ -130,6 +130,7 @@
       <AdditionalIncludeDirectories Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">error</AdditionalIncludeDirectories>
       <AdditionalIncludeDirectories Condition="'$(Configuration)|$(Platform)'=='Release|x64'">error</AdditionalIncludeDirectories>
     </ClCompile>
+    <ClCompile Include="mt_mempool.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="error\located_exception.h" />
