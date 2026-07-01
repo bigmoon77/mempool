@@ -36,7 +36,7 @@ namespace mempool_util {
 		static thread_local inline uint8_t current_tid = 1;
 		static inline std::atomic_uint8_t counter = 0;
 
-		struct entry {
+		struct entry  {
 			std::atomic_uint8_t mtx = 0;
 
 			void lock() {
@@ -160,7 +160,7 @@ struct mt_mempool {
 
 		std::set<type_info> tmap;
 
-		
+
 		std::vector<size_t> wait_inst_index_arr;
 		//gc中に追加されたオブジェクト
 		std::vector<size_t> gc_make_inst;
@@ -174,8 +174,6 @@ struct mt_mempool {
 
 		char data[chunk_size];
 
-		
-
 		allocator() {
 			ptr_mtx = &mempool_util::get_pointer_mutex();
 			gc_make_inst.reserve(chunk_size / 16);
@@ -185,7 +183,7 @@ struct mt_mempool {
 		~allocator() {
 
 #ifdef _DEBUG
-			
+
 			auto tail = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]);
 			size_t j = 0;
 			for (size_t i = 0; i < inst_ind; i++)
@@ -200,81 +198,78 @@ struct mt_mempool {
 #endif
 		}
 
-		char* allocate(size_t size,size_t align) {
+		bool allocateable(size_t size, size_t align) const noexcept{
 			std::lock_guard lock(allo_deallo_mtx);
-
-			//次の取得アドレスがアラインに沿っているか
-			back_ind += (uintptr_t)&data[back_ind] % align;
-			auto res = &data[back_ind];
-
-			back_ind += size;
-
-			return res;
-		}
-
-		bool allocateable(size_t size,size_t align) const {
-			std::lock_guard lock(allo_deallo_mtx);
-			return (back_ind + ((uintptr_t)&data[back_ind] % align)) + size < (chunk_size - (sizeof(inst_info) * 
+			return (back_ind + ((uintptr_t)&data[back_ind] % align)) + size < (chunk_size - (sizeof(inst_info) *
 				(inst_ind + 1)//これから追加するインスタンス情報分
 				));
 		}
 
-
-		//オブジェクトへのコンストラクタは呼ばない
 		template<typename t>
-		inst_info* make_inst(char* ptr) {
-			
+		t** construct() {
+
 			inst_info* info_ptr;
 
 			{
-				//std::lock_guard lock(wait_inst_mtx);
-				wait_inst_mtx.lock();
+				std::lock_guard lock(wait_inst_mtx);
+
 				if (wait_inst_index_arr.empty()) {
-					info_ptr = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -
-						(inst_ind++);
+					info_ptr =
+						reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) - (inst_ind++);
 				}
 				else {
-					info_ptr = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -
+					info_ptr =
+						reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -
 						wait_inst_index_arr.back();
 					wait_inst_index_arr.pop_back();
 				}
-				wait_inst_mtx.unlock();
+				if (gc_now) {
+					gc_make_inst.emplace_back(//gc中に生成された物ならばindexを記録
+						static_cast<size_t>(
+							(inst_info*)&data[chunk_size - sizeof(inst_info)] - info_ptr
+							)
+					);
+				}
 			}
 
-			if (gc_now) {
-				gc_make_inst.emplace_back(//gc中に生成された物ならばindexを記録
-					static_cast<size_t>(
-						(
-							inst_info*)&data[chunk_size - sizeof(inst_info)] - info_ptr
-						)
-				);
-			}
-
-
-			
-			{//型追加
-				//std::lock_guard lock();
-				tmap_mtx.lock();
-				tmap.emplace(typeid(t),&move<t>);
-				tmap_mtx.unlock();
-			}
 
 
 			{
-				ptr_mtx->lock(info_ptr);
-
-				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
-					new (info_ptr) inst_info();
-				}
-
-				info_ptr->ptr = ptr;//info更新　この時点でデストラクタは呼ばれている必要がある
-				info_ptr->tid = typeid(t);
-
-				ptr_mtx->unlock(info_ptr);
+				std::lock_guard lock(tmap_mtx);
+				tmap.emplace(typeid(t), &move<t>);
 			}
 
-			return info_ptr;
-		}
+			
+
+
+
+			{
+				std::lock_guard lock(allo_deallo_mtx);
+				//次の取得アドレスがアラインに沿っているか
+				back_ind += (uintptr_t)&data[back_ind] % alignof(t);
+
+
+				ptr_mtx->lock(info_ptr);
+
+				info_ptr->ptr = &data[back_ind];//info更新　この時点でデストラクタは呼ばれている必要がある
+				back_ind += sizeof(t);
+			}
+
+			if constexpr (!std::is_trivially_copyable_v<inst_info>) {
+				new (info_ptr) inst_info();
+			}
+
+			info_ptr->tid = typeid(t);
+
+			if constexpr (!std::is_trivially_copyable_v<t>) {
+				new (info_ptr->ptr) t();
+			}
+
+
+			ptr_mtx->unlock(info_ptr);
+
+			return (t**)(char*)info_ptr;
+		};
 
 
 		//オブジェクトへのデストラクは呼ばない
@@ -283,8 +278,6 @@ struct mt_mempool {
 			//gcが終わるまで待機
 
 			{
-
-
 				ptr_mtx->lock(ptr);
 
 				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
@@ -315,7 +308,7 @@ struct mt_mempool {
 
 		void gc() {
 
-			auto next_ptr = data;// .get();
+			auto next_ptr = data;
 
 			size_t wait_ind = 0;//wait_ind[wait_ind]の部分は飛ばして読む
 			
@@ -545,56 +538,43 @@ struct mt_mempool {
 	template<typename t>
 	std::unique_ptr<t*,inst_deleter<t>> construct() {
 
+		for (auto& chunk : chunk_arr)
 		{
-			
-			std::lock_guard lock(mtx);
-			for (auto& chunk : chunk_arr)
-			{
-				if (chunk->allocateable(sizeof(t), alignof(t))) {
-					
-					allocator* owner = chunk.get();
+			if (chunk->allocateable(sizeof(t), alignof(t))) {
 
-					return std::unique_ptr<t*, inst_deleter<t>>(
-						(t**)(char*)owner->make_inst<t>(
-							(char*)new (reinterpret_cast<t*>(chunk->allocate(sizeof(t), alignof(t))))t()),
-						inst_deleter<t>(owner)
-					);
-				}
+				return std::unique_ptr<t*, inst_deleter<t>>(
+					chunk->construct<t>(),
+					inst_deleter<t>(chunk.get())
+				);
 			}
 		}
 
-		{
-			//scoped_timer timer("emplace construct");
+		allocator* owner = chunk_arr.emplace_back(std::make_unique<allocator>()).get();
 
-
-			allocator* owner = chunk_arr.emplace_back(std::make_unique<allocator>()).get();
-
-			return std::unique_ptr<t*, inst_deleter<t>>(
-				(t**)(char*)owner->make_inst<t>((char*)
-					new (
-						reinterpret_cast<t*>(owner->allocate(sizeof(t), alignof(t)))
-						)t()
-				),
-				inst_deleter<t>(owner)
-			);
-		}
+		return std::unique_ptr<t*, inst_deleter<t>>(
+			owner->construct<t>(),
+			inst_deleter<t>(owner)
+		);
 	}
 };
 
 
 template<typename t>
 struct accessor {
-	
+	mempool_util::pointer_mutex& mtx;
+
+	accessor() : mtx(mempool_util::get_pointer_mutex()) {}
 	t& operator()(void* info) {
 		return *(t*)((mt_mempool::inst_info*)info)->ptr;
 	}
 
 	void lock(const std::unique_ptr<t*,mt_mempool::inst_deleter<t>>& ptr) {
-		mempool_util::get_pointer_mutex().lock(ptr.get());
+		//mempool_util::get_pointer_mutex().lock(ptr.get());
+		mtx.lock(ptr.get());
 	}
 
 	void unlock(const std::unique_ptr<t*, mt_mempool::inst_deleter<t>>& ptr) {
-		mempool_util::get_pointer_mutex().unlock(ptr.get());
+		mtx.unlock(ptr.get());
 	}
 };
 
