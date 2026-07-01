@@ -10,6 +10,7 @@
 #include <map>
 #include <iostream>
 #include <iomanip>
+#include <list>
 
 #include "error/located_exception.h"
 
@@ -151,312 +152,108 @@ struct mt_mempool {
 		std::type_index tid = typeid(void);
 	};
 
-	struct allocator {
-		mempool_util::pointer_mutex* ptr_mtx;
+	static inline std::pmr::synchronized_pool_resource inst_pool;
 
+	struct allocator {
+		mutable std::mutex inst_mtx;
 		mutable std::mutex allo_deallo_mtx;
 		mutable std::mutex tmap_mtx;
-		mutable std::mutex wait_inst_mtx;
-
 		std::set<type_info> tmap;
 
+		mempool_util::pointer_mutex* ptr_mtx;
 
-		std::vector<size_t> wait_inst_index_arr;
-		//gc中に追加されたオブジェクト
-		std::vector<size_t> gc_make_inst;
-		//次オブジェクトを作成する際のindex
 		size_t back_ind = 0;
-
-		//次作成する際のinst_infoのindex
-		size_t inst_ind = 0;
-
-		bool gc_now = false;
-
 		char data[chunk_size];
+		std::pmr::list<inst_info> inst_list;
 
-		allocator() {
+		allocator() : inst_list(&inst_pool){
 			ptr_mtx = &mempool_util::get_pointer_mutex();
-			gc_make_inst.reserve(chunk_size / 16);
-			wait_inst_index_arr.reserve(chunk_size / 16);
 		}
 
 		~allocator() {
 
-#ifdef _DEBUG
-
-			auto tail = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]);
-			size_t j = 0;
-			for (size_t i = 0; i < inst_ind; i++)
-			{
-				if (i == wait_inst_index_arr[j]) {
-					++j;
-					continue;
-				}
-
-				std::cerr << "leak " << (tail - i)->ptr << std::endl;
-			}
-#endif
 		}
 
-		bool allocateable(size_t size, size_t align) const noexcept{
+		template<typename t>
+		bool allocateable() const noexcept{
 			std::lock_guard lock(allo_deallo_mtx);
-			return (back_ind + ((uintptr_t)&data[back_ind] % align)) + size < (chunk_size - (sizeof(inst_info) *
-				(inst_ind + 1)//これから追加するインスタンス情報分
-				));
+			return (back_ind + (uintptr_t)&data[back_ind] % alignof(t)) + sizeof(t) < chunk_size;
 		}
 
 		template<typename t>
 		t** construct() {
 
-			inst_info* info_ptr;
-
-			{
-				std::lock_guard lock(wait_inst_mtx);
-
-				if (wait_inst_index_arr.empty()) {
-					info_ptr =
-						reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) - (inst_ind++);
-				}
-				else {
-					info_ptr =
-						reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -
-						wait_inst_index_arr.back();
-					wait_inst_index_arr.pop_back();
-				}
-				if (gc_now) {
-					gc_make_inst.emplace_back(//gc中に生成された物ならばindexを記録
-						static_cast<size_t>(
-							(inst_info*)&data[chunk_size - sizeof(inst_info)] - info_ptr
-							)
-					);
-				}
-			}
-
-
+			inst_mtx.lock();
+			inst_info* info_ptr = &inst_list.emplace_back();
+			inst_mtx.unlock();
 
 			{
 				std::lock_guard lock(tmap_mtx);
 				tmap.emplace(typeid(t), &move<t>);
 			}
 
-			
-
-
+			char* ptr;
 
 			{
 				std::lock_guard lock(allo_deallo_mtx);
 				//次の取得アドレスがアラインに沿っているか
 				back_ind += (uintptr_t)&data[back_ind] % alignof(t);
-
-
-				ptr_mtx->lock(info_ptr);
-
-				info_ptr->ptr = &data[back_ind];//info更新　この時点でデストラクタは呼ばれている必要がある
+				ptr = &data[back_ind];//info更新　この時点でデストラクタは呼ばれている必要がある
 				back_ind += sizeof(t);
 			}
+
+			ptr_mtx->lock(info_ptr);
 
 			if constexpr (!std::is_trivially_copyable_v<inst_info>) {
 				new (info_ptr) inst_info();
 			}
 
+			info_ptr->ptr = ptr;
 			info_ptr->tid = typeid(t);
 
 			if constexpr (!std::is_trivially_copyable_v<t>) {
 				new (info_ptr->ptr) t();
 			}
 
-
 			ptr_mtx->unlock(info_ptr);
 
 			return (t**)(char*)info_ptr;
 		};
 
-
-		//オブジェクトへのデストラクは呼ばない
 		void erase_inst(inst_info* ptr) {
-
-			//gcが終わるまで待機
-
-			{
-				ptr_mtx->lock(ptr);
-
-				if constexpr (!std::is_trivially_copyable_v<inst_info>) {
-					ptr->~inst_info();
-				}
-
-				ptr->tid = typeid(void);
-				ptr_mtx->unlock(ptr);
-			}
-
-			auto wait_ind = 
-				static_cast<size_t>(
-					reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]) -//最後尾のptr
-					ptr
-				);
-
-			std::lock_guard lock(wait_inst_mtx);
-			
-			wait_inst_index_arr.insert(
-				std::lower_bound(
-					wait_inst_index_arr.begin(), wait_inst_index_arr.end(),
-					wait_ind
-				),//insert_sort
-				wait_ind
-			);
+			ptr_mtx->lock(ptr);
+			ptr->tid = typeid(void);
+			ptr_mtx->unlock(ptr);
 		}
 
 
 		void gc() {
 
-			auto next_ptr = data;
-
-			size_t wait_ind = 0;//wait_ind[wait_ind]の部分は飛ばして読む
-			
-
-			//ダブルバッファリング
-			std::vector<size_t> temp_wait_inst_index_arr;
-			std::set<type_info> tmap;
+			decltype(inst_list.end()) end;
+			decltype(inst_list.end()) i;
 
 			{
-				std::lock_guard tmap_lock(tmap_mtx);
-				tmap = this->tmap;
+				std::lock_guard lock(inst_mtx);
+				i = inst_list.begin();
+				end = inst_list.end();
 			}
+			char* next = data;
+
 			
-			size_t temp_inst_ind;
-			
-			
+			for(; i != end; ++i)
 			{
-				std::lock_guard lock(wait_inst_mtx);
-				temp_wait_inst_index_arr = wait_inst_index_arr;
-				temp_inst_ind = inst_ind;
+				ptr_mtx->lock(&i);
 
-				gc_now = true;//追加もここのmtxで行われるので漏らしはない
-			}
-
-
-			//非同期フェーズ
-#pragma region
-			{
-				std::vector<size_t> inst_ind_arr;
-				inst_ind_arr.resize(temp_inst_ind - temp_wait_inst_index_arr.size());
-
-
-				if (temp_wait_inst_index_arr.size()) {
-					size_t j = 0;
-					size_t k = 0;
-
-					for (size_t i = 0; i < temp_inst_ind; i++)
-					{
-						if (i != temp_wait_inst_index_arr[j]) {//iは待機indexではない
-							inst_ind_arr[k++] = i;//そのindexが待機indexかを見る
-						}
-						else {
-
-
-							if (temp_wait_inst_index_arr.size() == ++j) {//あとは空白無し
-
-								for (size_t l = i + 1; l < temp_inst_ind; ++l)
-								{
-									inst_ind_arr[k++] = l;
-								}
-
-								break;
-							}
-						}
-
-					}
-				}
-				else {
-
-					for (size_t i = 0; i < temp_inst_ind; i++)
-					{
-						inst_ind_arr[i] = i;
-					}
-				}
-
-				//最後尾のinst_info
-				//ケツから確保しているので注意
-				auto inst_tail = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]);
-
-				std::sort(inst_ind_arr.begin(), inst_ind_arr.end(),
-					[&inst_tail](const size_t& l, const size_t& r) {
-						return
-							(inst_tail - l)->ptr <
-							(inst_tail - r)->ptr;
-					});
-
-
-				for (auto& i : inst_ind_arr)
 				{
-					inst_info* inst_ptr = (inst_tail - i);
-
-					ptr_mtx->lock(inst_ptr);
-					if (inst_ptr->tid == typeid(void)) {//途中で破棄された
-						ptr_mtx->unlock(inst_ptr);
-						continue;
-					}
-
-					auto preview_loc = inst_ptr->ptr;
-					inst_ptr->ptr = next_ptr;//new loc
-
-					next_ptr = tmap.find({ inst_ptr->tid,nullptr })->move(inst_ptr->ptr, preview_loc);
-
-					ptr_mtx->unlock(inst_ptr);
-
-				}
-			}
-
-
-#pragma endregion
-
-
-			//同期フェーズ
-#pragma region
-
-			{
-				//最後尾のinst_info
-				//ケツから確保しているので注意
-				auto inst_tail = reinterpret_cast<inst_info*>(&data[chunk_size - sizeof(inst_info)]);
-
-				//backindの固定に必要
-				std::lock_guard allo_lock(allo_deallo_mtx);
-				//gc中に追加されたオブジェクトだけ追跡する機能が必要
-				//back_indexの整合性を保つには、gc中追加されたインスタンスを走査し、これらのメモリ位置を変更する必要がある
-				
-				for (auto& i : gc_make_inst)
-				{
-					inst_info* inst_ptr = (inst_tail - i);
-
-
-
-					ptr_mtx->lock(inst_ptr); 
-					if (inst_ptr->tid == typeid(void)) {//途中で破棄された
-						ptr_mtx->unlock(inst_ptr);
-						continue;
-					}
-
-					auto type = tmap.find({ inst_ptr->tid,nullptr });
-
-					auto preview_loc = inst_ptr->ptr;
-					inst_ptr->ptr = next_ptr;//new loc
-
-					//アラインメント考慮は関数が行う
-					//帰り値は次のptr
-					next_ptr = type->move(inst_ptr->ptr, preview_loc);
-
-					ptr_mtx->unlock(inst_ptr);
-
+					std::lock_guard lock(tmap_mtx);
+					next = tmap.find({ i->tid })->move(next, i->ptr);
 				}
 
-				back_ind = static_cast<size_t>(next_ptr - data);
-
-				std::lock_guard wait_lock(wait_inst_mtx);
-				gc_now = false;
+				ptr_mtx->unlock(&i);
 			}
-#pragma endregion
 
-
-
+			std::lock_guard lock(allo_deallo_mtx);
+			back_ind = (next - &data[0]);
 		}
 
 	};
@@ -540,7 +337,7 @@ struct mt_mempool {
 
 		for (auto& chunk : chunk_arr)
 		{
-			if (chunk->allocateable(sizeof(t), alignof(t))) {
+			if (chunk->allocateable<t>()) {
 
 				return std::unique_ptr<t*, inst_deleter<t>>(
 					chunk->construct<t>(),

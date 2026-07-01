@@ -1063,8 +1063,8 @@ int main() {
             << loop_count
             << "\n";
 
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        benchmark_mt_gc_parallel(object_count, loop_count);
+        //std::this_thread::sleep_for(std::chrono::seconds(1));
+        //benchmark_mt_gc_parallel(object_count, loop_count);
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
         benchmark_mt_mempool(object_count, loop_count);
