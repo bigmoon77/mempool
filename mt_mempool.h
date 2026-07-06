@@ -369,11 +369,13 @@ struct mt_mempool {
 					p->ptr = next;
 					next = p->move(p->ptr, src, destroy_flag);//削除する場合next freeがnull
 
-					std::lock_guard inst_lock(inst_mtx);
-					
 					if (destroy_flag) {
+						
+						inst_mtx.lock();
 						p->next_free = free_head;
 						free_head = p;
+						inst_mtx.unlock();
+
 						p->ptr = nullptr;//インスタンス無効化
 					}
 				}
