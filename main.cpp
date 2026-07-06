@@ -721,10 +721,15 @@ void benchmark_mt_mempool(
             {
                 ptrs.emplace_back(pool.construct<test_object>());
             }
-
+     
             ptrs.clear();
+
+            for (auto& chunk : pool.chunk_arr)
+                chunk->gc();
+
         }
     }
+
 
     //--------------------------------------------
     // construct only
@@ -741,6 +746,9 @@ void benchmark_mt_mempool(
         }
     }
 
+    for (auto& chunk : pool.chunk_arr)
+        chunk->gc();
+
     //--------------------------------------------
     // GC
     //--------------------------------------------
@@ -756,6 +764,7 @@ void benchmark_mt_mempool(
             chunk->gc();
     }
 
+
     //--------------------------------------------
     // GC + accessor
     //--------------------------------------------
@@ -766,7 +775,6 @@ void benchmark_mt_mempool(
         {
             ptrs.emplace_back(pool.construct<test_object>());
             acc(ptrs.back().get()).buffer[0] = 'a';
-
         }
 
         scoped_timer timer("gc + accessor");

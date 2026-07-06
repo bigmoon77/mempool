@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -11,6 +11,8 @@
 #include <iostream>
 #include <iomanip>
 #include <list>
+#include <deque>
+
 
 #include "error/located_exception.h"
 
@@ -34,7 +36,7 @@ namespace mempool_util {
 
 	struct pointer_mutex {
 
-		//•’Ê‚Ìmutex‚Ì•û‚ª‘¬‚©‚Á‚½
+		//æ™®é€šã®mutexã®æ–¹ãŒé€Ÿã‹ã£ãŸ
 		//static thread_local inline uint8_t current_tid = 1;
 		//static inline std::atomic_uint8_t counter = 0;
 		//
@@ -66,7 +68,7 @@ namespace mempool_util {
 		std::mutex arr[size];
 
 		static inline size_t make_hash(void* ptr)noexcept {
-			return (uintptr_t)ptr;//shift‚µ‚È‚¢•û‚ª‘¬‚©‚Á‚½
+			return (uintptr_t)ptr;//shiftã—ãªã„æ–¹ãŒé€Ÿã‹ã£ãŸ
 		}
 
 		static void init_thread() {
@@ -88,6 +90,7 @@ namespace mempool_util {
 
 struct mt_mempool {
 
+	
 	class scoped_timer {
 		using clock = std::chrono::high_resolution_clock;
 
@@ -112,33 +115,133 @@ struct mt_mempool {
 				<< _name
 				<< " : "
 				<< ns
-				<< " ns"
-				<< std::endl;
+					<< " ns"
+					<< std::endl;
 		}
 	};
 
 	static constexpr size_t chunk_size = 144 * 100000;
 
 	struct inst_info {
-		char* ptr = nullptr;//ƒIƒuƒWƒFƒNƒg‚ªŠi”[‚³‚ê‚½ptr‚ğw‚· •K‚¸æ“ª‚É
-		//std::type_index tid = typeid(void);//void‚Ìê‡íœÏ‚İ‚ğ¦‚·
-		//size_t tid = 0;//tmap‚Ìindex‚ğw‚·
+		char* ptr;//ã‚ªãƒ–ã‚¸ã‚§ã‚¯ãƒˆãŒæ ¼ç´ã•ã‚ŒãŸptrã‚’æŒ‡ã™ å¿…ãšå…ˆé ­ã«
+		//std::type_index tid = typeid(void);//voidã®å ´åˆå‰Šé™¤æ¸ˆã¿ã‚’ç¤ºã™
+		//size_t tid = 0;//tmapã®indexã‚’æŒ‡ã™
+		char* (*move)(char*&, char*, bool);
 
-		char* (*move)(char*&, char*) = nullptr;
+		//æœ€åˆã¯nullä»¥å¤–ã®é©å½“ãªå€¤ã‚’å…¥ã‚Œã¦ãŠã
+		inst_info* next_free;
+	};
 
+
+	struct append_only_deque {
+
+		static inline constexpr size_t chunk_size = mempool_util::pow2<10>();
+
+		using value_type = inst_info;
+
+		struct chunk {
+			char data[sizeof(value_type) * chunk_size];
+		};
+
+		std::vector<chunk*> chunk_arr;
+
+		size_t back_ind = 0;
+		struct iterator {
+			size_t cind = 0;
+			size_t ind = 0;
+			decltype(chunk_arr) arr;
+
+			iterator(size_t cind, size_t ind, decltype(chunk_arr)& arr)
+				:cind(cind), ind(ind), arr(arr) {
+
+			}
+
+			iterator() = default;
+
+			value_type* operator ->() {
+				return
+					&reinterpret_cast<value_type*>(arr[cind]->data)[ind];
+			}
+
+			value_type& operator*() {
+				return
+					reinterpret_cast<value_type*>(arr[cind]->data)[ind];
+			}
+
+			void operator ++() {
+				++ind;
+				ind = (ind != chunk_size) * ind;//åŠ ç®—ã—ã¦ã‚µã‚¤ã‚ºä¸Šé™ã®å ´åˆ0
+				cind += (ind == 0);//å…ˆã«indã‚’å‡¦ç†ã™ã‚‹ã®ã§ã“ã®æ™‚ç‚¹ã§0ã®å ´åˆã€ãƒãƒ£ãƒ³ã‚¯å…¥ã‚Œä»£ã‚ã‚Šç›´å¾Œ
+			}
+
+			bool operator != (const iterator& other)const {
+				return std::memcmp(this, &other, sizeof(size_t) * 2);
+			}
+		};
+
+		~append_only_deque() {
+			for (auto& i : chunk_arr)
+			{
+				delete i;
+			}
+		}
+
+		value_type& emplace_back() {
+			auto ind = back_ind % chunk_size;
+
+			if (ind) {
+				value_type& res = reinterpret_cast<value_type*>(
+					chunk_arr.back()->data
+					)[ind];
+
+				++back_ind;
+				//back_ind %= chunk_size;
+				return res;
+			}
+
+			chunk_arr.emplace_back(new chunk);
+			value_type& res = reinterpret_cast<value_type*>(
+				chunk_arr.back()->data
+				)[ind];
+
+			++back_ind;
+			//back_ind %= chunk_size;
+			return res;
+		}
+
+		iterator begin() {
+			return iterator(0, 0, chunk_arr);
+		}
+		iterator end() {
+
+			if (back_ind % chunk_size == 0){
+
+				return iterator(chunk_arr.size(),
+					0,
+					chunk_arr);
+			}
+			else {
+
+				return iterator(chunk_arr.size() - 1,
+					back_ind % chunk_size,
+					chunk_arr);
+			}
+		}
 	};
 
 	struct allocator {
 		mutable std::mutex inst_mtx;
 		mutable std::mutex allo_deallo_mtx;
-		std::pmr::unsynchronized_pool_resource inst_pool;
 		mempool_util::pointer_mutex* ptr_mtx;
 
 		size_t back_ind = 0;
 		char data[chunk_size];
-		std::pmr::list<inst_info> inst_list;
+		//free listã®å°å…¥ã§å¢—ãˆã£ã±ãªã—ãªã®ã§dequeãŒæœ€é€Ÿ
+		//std::pmr::list<inst_info> inst_list;
+		append_only_deque inst_list;
+		inst_info* free_head = nullptr;
 
-		allocator() : inst_list(&inst_pool){
+		allocator(){
 			ptr_mtx = &mempool_util::get_pointer_mutex();
 		}
 
@@ -148,27 +251,43 @@ struct mt_mempool {
 
 		template<typename t>
 		bool allocateable() const noexcept{
-			std::unique_lock<std::mutex> lk(allo_deallo_mtx, std::try_to_lock);
-			return lk && (back_ind + (uintptr_t)&data[back_ind] % alignof(t)) + sizeof(t) < chunk_size;
+		
+			return allo_deallo_mtx.try_lock() &&
+				
+				//è¦ç´ ãŒç¢ºä¿ã§ãã‚‹å ´åˆã«ã¯falseãŒå¸°ã‚‹ã®ã§åè»¢
+				!(
+					//è¦ç´ ãŒç¢ºä¿ã§ããªã„å ´åˆã«trueã‚’è¿”ã™ã®ã§å¾Œã‚ã‚’å®Ÿè¡Œã§ãã‚‹
+					!((back_ind + (uintptr_t)&data[back_ind] % alignof(t)) + sizeof(t) < chunk_size) &&
+					//è¦ç´ ãŒç¢ºä¿ã§ããªã„å ´åˆã«ã¯å³åº§ã«ã‚¢ãƒ³ãƒ­ãƒƒã‚¯
+					(allo_deallo_mtx.unlock(), true));
 		}
 
 		template<typename t>
 		t** construct() {
 			inst_info* info_ptr;
 
+
 			{
 				std::lock_guard lock(inst_mtx);
-				info_ptr = &inst_list.emplace_back();
-				info_ptr->move = &move<t>;
+
+				if (free_head) {
+					info_ptr = free_head;			
+					free_head = free_head->next_free;
+				}
+				else {
+				 	info_ptr = &inst_list.emplace_back();
+				}
 			}
+			info_ptr->next_free = reinterpret_cast<inst_info*>(0xfffffffff);
+			info_ptr->move = &move<t>;
 
 
 			{
-				std::lock_guard lock(allo_deallo_mtx);
-				//Ÿ‚Ìæ“¾ƒAƒhƒŒƒX‚ªƒAƒ‰ƒCƒ“‚É‰ˆ‚Á‚Ä‚¢‚é‚©
+				//æ¬¡ã®å–å¾—ã‚¢ãƒ‰ãƒ¬ã‚¹ãŒã‚¢ãƒ©ã‚¤ãƒ³ã«æ²¿ã£ã¦ã„ã‚‹ã‹
 				back_ind += (uintptr_t)&data[back_ind] % alignof(t);
-				info_ptr->ptr = &data[back_ind];//infoXV@‚±‚Ì“_‚ÅƒfƒXƒgƒ‰ƒNƒ^‚ÍŒÄ‚Î‚ê‚Ä‚¢‚é•K—v‚ª‚ ‚é
+				info_ptr->ptr = &data[back_ind];
 				back_ind += sizeof(t);
+				allo_deallo_mtx.unlock();
 			}
 
 
@@ -178,9 +297,48 @@ struct mt_mempool {
 			return reinterpret_cast<t**>(reinterpret_cast<char*>(info_ptr));
 		};
 
+
+		template<typename t>
+		t** back_ind_lock_construct() {
+			inst_info* info_ptr;
+
+
+			{
+				std::lock_guard lock(inst_mtx);
+
+				if (free_head) {
+					info_ptr = free_head;
+					free_head = free_head->next_free;
+				}
+				else {
+					info_ptr = &inst_list.emplace_back();
+				}
+			}
+
+			info_ptr->next_free = reinterpret_cast<inst_info*>(0xfffffffff);
+			info_ptr->move = &move<t>;
+
+			{
+				std::lock_guard lock(allo_deallo_mtx);
+
+				//æ¬¡ã®å–å¾—ã‚¢ãƒ‰ãƒ¬ã‚¹ãŒã‚¢ãƒ©ã‚¤ãƒ³ã«æ²¿ã£ã¦ã„ã‚‹ã‹
+				back_ind += (uintptr_t)&data[back_ind] % alignof(t);
+				info_ptr->ptr = &data[back_ind];
+				back_ind += sizeof(t);
+				
+			}
+
+
+			if constexpr (!std::is_trivially_copyable_v<t>) {
+				new (info_ptr->ptr) t();
+			}
+
+			return reinterpret_cast<t**>(reinterpret_cast<char*>(info_ptr));
+		};
+
 		void erase_inst(inst_info* ptr) {
-			ptr_mtx->lock(ptr);
-			ptr->move = nullptr;
+			ptr_mtx->lock(ptr);//gcã‚¹ãƒ¬ãƒƒãƒ‰ã¨ã®ã‚¢ã‚¯ã‚»ã‚¹ç«¶åˆã®ç‚ºå‰Šé™¤ã—ã¦ã¯ã„ã‘ãªã„
+			ptr->next_free = nullptr;//å‰Šé™¤ãƒ•ãƒ©ã‚°ã®ä»£ã‚ã‚Š
 			ptr_mtx->unlock(ptr);
 		}
 
@@ -190,6 +348,7 @@ struct mt_mempool {
 			decltype(inst_list.end()) end;
 			decltype(inst_list.end()) i;
 
+			std::lock_guard lock(allo_deallo_mtx);
 			{
 				std::lock_guard lock(inst_mtx);
 				i = inst_list.begin();
@@ -198,28 +357,38 @@ struct mt_mempool {
 			char* next = data;
 
 			
-			for(; i != end;)
+			//ç„¡åŠ¹ãªinfoã‚‚ã¾ã¨ã‚ã¦ã‚¤ãƒ†ãƒ¬ãƒ¼ãƒˆã™ã‚‹ç‚ºæ³¨æ„
+			for(; i != end;++i)
 			{
-				ptr_mtx->lock(&i);
+				auto p = &(*i);
 
-				if (!i->move) {
-					ptr_mtx->unlock(&i);
-					i = inst_list.erase(i);
-
+				ptr_mtx->lock(p);
+				//ç„¡åŠ¹ã‚¤ãƒ³ã‚¹ã‚¿ãƒ³ã‚¹é¿ã‘
+				if (p->ptr == nullptr) {
+					ptr_mtx->unlock(p);
 					continue;
 				}
 
 				{
-					auto src = i->ptr;
-					next = i->move(i->ptr, src);
+					auto src = p->ptr;
+					bool destroy_flag = p->next_free == nullptr;
+
+					p->ptr = next;
+					next = p->move(p->ptr, src, destroy_flag);//å‰Šé™¤ã™ã‚‹å ´åˆnext freeãŒnull
+
+					std::lock_guard inst_lock(inst_mtx);
+					
+					if (destroy_flag) {
+						p->next_free = free_head;
+						free_head = p;
+						p->ptr = nullptr;//ã‚¤ãƒ³ã‚¹ã‚¿ãƒ³ã‚¹ç„¡åŠ¹åŒ–
+					}
 				}
 
-				ptr_mtx->unlock(&i);
+				ptr_mtx->unlock(p);
 				
-				++i;
 			}
 
-			std::lock_guard lock(allo_deallo_mtx);
 			back_ind = (next - &data[0]);
 		}
 
@@ -233,10 +402,8 @@ struct mt_mempool {
 		inst_deleter(inst_deleter&& other) = default;
 
 		void operator()(void* block)const {
-			static_assert(std::is_standard_layout_v<inst_info>, "ƒ|ƒCƒ“ƒ^•ÏŠ·‚ªs‚¦‚È‚¢ŠÂ‹«");
-			if constexpr (!std::is_trivially_copyable_v<t>) {//ƒgƒŠƒrƒAƒ‹Œ^ˆÈŠO‚ÍƒfƒXƒgƒ‰ƒNƒg	
-				reinterpret_cast<t*>(block)->~t();
-			}
+			static_assert(std::is_standard_layout_v<inst_info>, "ãƒã‚¤ãƒ³ã‚¿å¤‰æ›ãŒè¡Œãˆãªã„ç’°å¢ƒ");
+			//ãƒ‡ã‚¹ãƒˆãƒ©ã‚¯ãƒˆã¯GCã§è¡Œã†ç‚ºå®£è¨€ã ã‘è¡Œã†
 			owner->erase_inst(reinterpret_cast<inst_info*>(block));
 		}
 	};
@@ -244,10 +411,10 @@ struct mt_mempool {
 
 	/// <summary>
 	/// 
-	/// w’èˆÊ’u‚ÉƒIƒuƒWƒFƒNƒg‚ğ\’z‚·‚é
-	/// Ÿ‚ÌƒIƒuƒWƒFƒNƒgƒAƒhƒŒƒX‚ğ•Ô‚·
+	/// æŒ‡å®šä½ç½®ã«ã‚ªãƒ–ã‚¸ã‚§ã‚¯ãƒˆã‚’æ§‹ç¯‰ã™ã‚‹
+	/// æ¬¡ã®ã‚ªãƒ–ã‚¸ã‚§ã‚¯ãƒˆã‚¢ãƒ‰ãƒ¬ã‚¹ã‚’è¿”ã™
 	/// 
-	/// dst‚ÍƒAƒ‰ƒCƒ“ƒƒ“ƒg’²®‚µ‚Ä•Ô‚³‚ê‚éˆ×’ˆÓ
+	/// dstã¯ã‚¢ãƒ©ã‚¤ãƒ³ãƒ¡ãƒ³ãƒˆèª¿æ•´ã—ã¦è¿”ã•ã‚Œã‚‹ç‚ºæ³¨æ„
 	/// </summary>
 	/// <typeparam name="t"></typeparam>
 	/// <param name="dst"></param>
@@ -255,22 +422,30 @@ struct mt_mempool {
 	/// <param name="size"></param>
 	/// <returns></returns>
 	template<typename t>
-	static char* move(char*& dst,char* src) {
+	static char* move(char*& dst,char* src,bool src_destroy) {
 
-		dst += ((uintptr_t)dst % alignof(t));//ƒAƒ‰ƒCƒ“ƒƒ“ƒg‹l‚ß‚ÌƒAƒhƒŒƒX‚É‚·‚é
+		if (src_destroy) {
+			if constexpr (!std::is_trivially_copyable_v<t>) {
+				reinterpret_cast<t*>(src)->~t();
+			}
+			return dst;
+		}
+		
+
+		dst += ((uintptr_t)dst % alignof(t));//ã‚¢ãƒ©ã‚¤ãƒ³ãƒ¡ãƒ³ãƒˆè©°ã‚ã®ã‚¢ãƒ‰ãƒ¬ã‚¹ã«ã™ã‚‹
 
 		if constexpr (std::is_trivially_copyable_v<t>) {
 			std::memmove(dst, src, sizeof(t));
 		}
 		else {
 #ifdef _DEBUG
-			if (dst > src) {//dst‚Ì•û‚ª‘O‚Å‚ ‚é‚×‚«
+			if (dst > src) {//dstã®æ–¹ãŒå‰ã§ã‚ã‚‹ã¹ã
 				throw error::located_exception("fetal error invalid object move");
 			}
 #endif
-			//ƒAƒhƒŒƒX‹——£‚ªƒIƒuƒWƒFƒNƒg‚ÌƒTƒCƒY–¢–‚¾‚Á‚½ê‡AˆÚ“®æ‚ÆˆÚ“®Œ³‚Íd‚È‚Á‚Ä‚¢‚é
+			//ã‚¢ãƒ‰ãƒ¬ã‚¹è·é›¢ãŒã‚ªãƒ–ã‚¸ã‚§ã‚¯ãƒˆã®ã‚µã‚¤ã‚ºæœªæº€ã ã£ãŸå ´åˆã€ç§»å‹•å…ˆã¨ç§»å‹•å…ƒã¯é‡ãªã£ã¦ã„ã‚‹
 
-			if ((dst - src) < sizeof(t)) {//ŠÔ‚ª‚P—v‘fˆÈã‚ ‚é‚È‚ç‚Î–â‘è‚Í‚È‚¢ˆ×‚±‚Ì‹«ŠE
+			if ((dst - src) < sizeof(t)) {//é–“ãŒï¼‘è¦ç´ ä»¥ä¸Šã‚ã‚‹ãªã‚‰ã°å•é¡Œã¯ãªã„ç‚ºã“ã®å¢ƒç•Œ
 				t temp(std::move(
 					*reinterpret_cast<t*>(src)
 				));
@@ -287,7 +462,6 @@ struct mt_mempool {
 		return dst + sizeof(t);
 	}
 
-	std::mutex mtx;
 	std::vector<std::unique_ptr<allocator>> chunk_arr;
 
 	mt_mempool() {
@@ -301,22 +475,22 @@ struct mt_mempool {
 	template<typename t>
 	std::unique_ptr<t*,inst_deleter<t>> construct() {
 
+		for (auto& chunk : chunk_arr)
 		{
-			for (auto& chunk : chunk_arr)
-			{
-				if (chunk->allocateable<t>()) {
-					return std::unique_ptr<t*, inst_deleter<t>>(
-						chunk->construct<t>(),
-						inst_deleter<t>(chunk.get())
-					);
-				}
+			if (chunk->allocateable<t>()) {
+
+				return std::unique_ptr<t*, inst_deleter<t>>(
+					chunk->construct<t>(),
+					inst_deleter<t>(chunk.get())
+				);
 			}
 		}
+
 
 		allocator* owner = chunk_arr.emplace_back(std::make_unique<allocator>()).get();
 
 		return std::unique_ptr<t*, inst_deleter<t>>(
-			owner->construct<t>(),
+			owner->back_ind_lock_construct<t>(),
 			inst_deleter<t>(owner)
 		);
 	}
