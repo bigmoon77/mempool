@@ -34,42 +34,43 @@ namespace mempool_util {
 
 	struct pointer_mutex {
 
-		static thread_local inline uint8_t current_tid = 1;
-		static inline std::atomic_uint8_t counter = 0;
-
-		struct entry  {
-			std::atomic_uint8_t mtx = 0;
-
-			void lock() {
-
-				while (true)
-				{
-					uint8_t temp = 0;
-					if (mtx.compare_exchange_weak(temp, current_tid))
-						break;
-					mtx.wait(temp);
-				}
-
-			}
-
-			void unlock() {
-				mtx.store(0);
-				mtx.notify_one();
-			}
-		};
+		//普通のmutexの方が速かった
+		//static thread_local inline uint8_t current_tid = 1;
+		//static inline std::atomic_uint8_t counter = 0;
+		//
+		//struct entry  {
+		//	std::atomic_uint8_t mtx = 0;
+		//
+		//	void lock() {
+		//
+		//		while (true)
+		//		{
+		//			uint8_t temp = 0;
+		//			if (mtx.compare_exchange_weak(temp, current_tid))
+		//				break;
+		//			mtx.wait(temp);
+		//		}
+		//
+		//	}
+		//
+		//	void unlock() {
+		//		mtx.store(0);
+		//		mtx.notify_one();
+		//	}
+		//};
 
 
 		static inline constexpr size_t size = mempool_util::pow2<10>();
 		static inline constexpr size_t mask = size - 1;
 
-		entry arr[size];
+		std::mutex arr[size];
 
 		static inline size_t make_hash(void* ptr)noexcept {
-			return (uintptr_t)ptr << 4;
+			return (uintptr_t)ptr;//shiftしない方が速かった
 		}
 
 		static void init_thread() {
-			current_tid = ++counter;
+			//current_tid = ++counter;
 		}
 
 		void lock(void* ptr) {
@@ -79,8 +80,6 @@ namespace mempool_util {
 			arr[make_hash(ptr) & mask].unlock();
 		}
 	};
-
-
 	pointer_mutex& get_pointer_mutex();
 };
 
@@ -118,48 +117,21 @@ struct mt_mempool {
 		}
 	};
 
-
 	static constexpr size_t chunk_size = 144 * 100000;
 
-	struct type_info {
-		std::type_index tid = typeid(void);
-		//dst,src
+	struct inst_info {
+		char* ptr = nullptr;//オブジェクトが格納されたptrを指す 必ず先頭に
+		//std::type_index tid = typeid(void);//voidの場合削除済みを示す
+		//size_t tid = 0;//tmapのindexを指す
+
 		char* (*move)(char*&, char*) = nullptr;
 
-		bool operator < (const type_info& other)const noexcept {
-			return tid < other.tid;
-		}
-		bool operator > (const type_info& other)const noexcept {
-			return tid < other.tid;
-		}
-		bool operator <= (const type_info& other)const noexcept {
-			return tid <= other.tid;
-		}
-		bool operator >= (const type_info& other)const noexcept {
-			return tid >= other.tid;
-		}
-		bool operator == (const type_info& other)const noexcept {
-			return tid == other.tid;
-		}
-
-		bool operator != (const type_info& other)const noexcept {
-			return tid != other.tid;
-		}
 	};
-
-	struct inst_info {
-		char* ptr = nullptr;//オブジェクトが格納されたptrを指す
-		std::type_index tid = typeid(void);
-	};
-
-	static inline std::pmr::synchronized_pool_resource inst_pool;
 
 	struct allocator {
 		mutable std::mutex inst_mtx;
 		mutable std::mutex allo_deallo_mtx;
-		mutable std::mutex tmap_mtx;
-		std::set<type_info> tmap;
-
+		std::pmr::unsynchronized_pool_resource inst_pool;
 		mempool_util::pointer_mutex* ptr_mtx;
 
 		size_t back_ind = 0;
@@ -176,53 +148,39 @@ struct mt_mempool {
 
 		template<typename t>
 		bool allocateable() const noexcept{
-			std::lock_guard lock(allo_deallo_mtx);
-			return (back_ind + (uintptr_t)&data[back_ind] % alignof(t)) + sizeof(t) < chunk_size;
+			std::unique_lock<std::mutex> lk(allo_deallo_mtx, std::try_to_lock);
+			return lk && (back_ind + (uintptr_t)&data[back_ind] % alignof(t)) + sizeof(t) < chunk_size;
 		}
 
 		template<typename t>
 		t** construct() {
-
-			inst_mtx.lock();
-			inst_info* info_ptr = &inst_list.emplace_back();
-			inst_mtx.unlock();
+			inst_info* info_ptr;
 
 			{
-				std::lock_guard lock(tmap_mtx);
-				tmap.emplace(typeid(t), &move<t>);
+				std::lock_guard lock(inst_mtx);
+				info_ptr = &inst_list.emplace_back();
+				info_ptr->move = &move<t>;
 			}
 
-			char* ptr;
 
 			{
 				std::lock_guard lock(allo_deallo_mtx);
 				//次の取得アドレスがアラインに沿っているか
 				back_ind += (uintptr_t)&data[back_ind] % alignof(t);
-				ptr = &data[back_ind];//info更新　この時点でデストラクタは呼ばれている必要がある
+				info_ptr->ptr = &data[back_ind];//info更新　この時点でデストラクタは呼ばれている必要がある
 				back_ind += sizeof(t);
 			}
 
-			ptr_mtx->lock(info_ptr);
-
-			if constexpr (!std::is_trivially_copyable_v<inst_info>) {
-				new (info_ptr) inst_info();
-			}
-
-			info_ptr->ptr = ptr;
-			info_ptr->tid = typeid(t);
 
 			if constexpr (!std::is_trivially_copyable_v<t>) {
 				new (info_ptr->ptr) t();
 			}
-
-			ptr_mtx->unlock(info_ptr);
-
-			return (t**)(char*)info_ptr;
+			return reinterpret_cast<t**>(reinterpret_cast<char*>(info_ptr));
 		};
 
 		void erase_inst(inst_info* ptr) {
 			ptr_mtx->lock(ptr);
-			ptr->tid = typeid(void);
+			ptr->move = nullptr;
 			ptr_mtx->unlock(ptr);
 		}
 
@@ -240,16 +198,25 @@ struct mt_mempool {
 			char* next = data;
 
 			
-			for(; i != end; ++i)
+			for(; i != end;)
 			{
 				ptr_mtx->lock(&i);
 
+				if (!i->move) {
+					ptr_mtx->unlock(&i);
+					i = inst_list.erase(i);
+
+					continue;
+				}
+
 				{
-					std::lock_guard lock(tmap_mtx);
-					next = tmap.find({ i->tid })->move(next, i->ptr);
+					auto src = i->ptr;
+					next = i->move(i->ptr, src);
 				}
 
 				ptr_mtx->unlock(&i);
+				
+				++i;
 			}
 
 			std::lock_guard lock(allo_deallo_mtx);
@@ -267,13 +234,13 @@ struct mt_mempool {
 
 		void operator()(void* block)const {
 			static_assert(std::is_standard_layout_v<inst_info>, "ポインタ変換が行えない環境");
-
 			if constexpr (!std::is_trivially_copyable_v<t>) {//トリビアル型以外はデストラクト	
-				reinterpret_cast<t*>(reinterpret_cast<inst_info*>(block)->ptr)->~t();
+				reinterpret_cast<t*>(block)->~t();
 			}
 			owner->erase_inst(reinterpret_cast<inst_info*>(block));
 		}
 	};
+
 
 	/// <summary>
 	/// 
@@ -304,7 +271,6 @@ struct mt_mempool {
 			//アドレス距離がオブジェクトのサイズ未満だった場合、移動先と移動元は重なっている
 
 			if ((dst - src) < sizeof(t)) {//間が１要素以上あるならば問題はない為この境界
-
 				t temp(std::move(
 					*reinterpret_cast<t*>(src)
 				));
@@ -335,14 +301,15 @@ struct mt_mempool {
 	template<typename t>
 	std::unique_ptr<t*,inst_deleter<t>> construct() {
 
-		for (auto& chunk : chunk_arr)
 		{
-			if (chunk->allocateable<t>()) {
-
-				return std::unique_ptr<t*, inst_deleter<t>>(
-					chunk->construct<t>(),
-					inst_deleter<t>(chunk.get())
-				);
+			for (auto& chunk : chunk_arr)
+			{
+				if (chunk->allocateable<t>()) {
+					return std::unique_ptr<t*, inst_deleter<t>>(
+						chunk->construct<t>(),
+						inst_deleter<t>(chunk.get())
+					);
+				}
 			}
 		}
 
@@ -366,7 +333,6 @@ struct accessor {
 	}
 
 	void lock(const std::unique_ptr<t*,mt_mempool::inst_deleter<t>>& ptr) {
-		//mempool_util::get_pointer_mutex().lock(ptr.get());
 		mtx.lock(ptr.get());
 	}
 

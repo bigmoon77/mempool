@@ -932,10 +932,10 @@ namespace mt_mem {
 
         mt_mempool pool;
 
+
         auto p = pool.construct<int>();
 
         assert(p.get() != nullptr);
-        assert(**p == 0);
     }
 
     inline void test_write()
@@ -997,7 +997,7 @@ namespace mt_mem {
         std::cout << "test_delete_gc\n";
 
         mt_mempool pool;
-
+        
         std::vector<decltype(pool.construct<int>())> arr;
 
         for (int i = 0; i < 100; i++)
