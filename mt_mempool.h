@@ -13,6 +13,7 @@
 #include <list>
 #include <deque>
 
+#include <cassert>
 
 #include "error/located_exception.h"
 
@@ -71,10 +72,6 @@ namespace mempool_util {
 			return (uintptr_t)ptr;//shiftしない方が速かった
 		}
 
-		static void init_thread() {
-			//current_tid = ++counter;
-		}
-
 		void lock(void* ptr) {
 			arr[make_hash(ptr) & mask].lock();
 		}
@@ -90,7 +87,6 @@ namespace mempool_util {
 
 struct mt_mempool {
 
-	
 	class scoped_timer {
 		using clock = std::chrono::high_resolution_clock;
 
@@ -130,8 +126,14 @@ struct mt_mempool {
 
 		//最初はnull以外の適当な値を入れておく
 		inst_info* next_free;
-	};
 
+		bool operator < (const inst_info& other)const {
+			return ptr < other.ptr;
+		}
+		bool operator == (const inst_info& other)const {
+			return ptr == other.ptr;
+		}
+	};
 
 	struct append_only_deque {
 
@@ -232,17 +234,15 @@ struct mt_mempool {
 	struct allocator {
 		mutable std::mutex inst_mtx;
 		mutable std::mutex allo_deallo_mtx;
-		mempool_util::pointer_mutex* ptr_mtx;
-
 		size_t back_ind = 0;
 		char data[chunk_size];
 		//free listの導入で増えっぱなしなのでdequeが最速
-		//std::pmr::list<inst_info> inst_list;
-		append_only_deque inst_list;
+		std::pmr::list<inst_info> inst_list;
+		//append_only_deque inst_list;
 		inst_info* free_head = nullptr;
 
 		allocator(){
-			ptr_mtx = &mempool_util::get_pointer_mutex();
+
 		}
 
 		~allocator() {
@@ -253,7 +253,6 @@ struct mt_mempool {
 		bool allocateable() const noexcept{
 		
 			return allo_deallo_mtx.try_lock() &&
-				
 				//要素が確保できる場合にはfalseが帰るので反転
 				!(
 					//要素が確保できない場合にtrueを返すので後ろを実行できる
@@ -336,13 +335,6 @@ struct mt_mempool {
 			return reinterpret_cast<t**>(reinterpret_cast<char*>(info_ptr));
 		};
 
-		void erase_inst(inst_info* ptr) {
-			ptr_mtx->lock(ptr);//gcスレッドとのアクセス競合の為削除してはいけない
-			ptr->next_free = nullptr;//削除フラグの代わり
-			ptr_mtx->unlock(ptr);
-		}
-
-
 		void gc() {
 
 			decltype(inst_list.end()) end;
@@ -351,6 +343,7 @@ struct mt_mempool {
 			std::lock_guard lock(allo_deallo_mtx);
 			{
 				std::lock_guard lock(inst_mtx);
+				inst_list.sort();
 				i = inst_list.begin();
 				end = inst_list.end();
 			}
@@ -394,20 +387,15 @@ struct mt_mempool {
 
 	};
 
-	template<typename t>
 	struct inst_deleter {
-		allocator* owner = nullptr;
-		inst_deleter(allocator* owner) : owner(owner) {};
-		inst_deleter(const inst_deleter& other) = default;
-		inst_deleter(inst_deleter&& other) = default;
-
 		void operator()(void* block)const {
 			static_assert(std::is_standard_layout_v<inst_info>, "ポインタ変換が行えない環境");
 			//デストラクトはGCで行う為宣言だけ行う
-			owner->erase_inst(reinterpret_cast<inst_info*>(block));
+			ptr_mtx->lock(block);//gcスレッドとのアクセス競合の為削除してはいけない
+			reinterpret_cast<inst_info*>(block)->next_free = nullptr;//削除フラグの代わり
+			ptr_mtx->unlock(block);
 		}
 	};
-
 
 	/// <summary>
 	/// 
@@ -462,37 +450,64 @@ struct mt_mempool {
 		return dst + sizeof(t);
 	}
 
-	std::vector<std::unique_ptr<allocator>> chunk_arr;
+	std::list<std::unique_ptr<allocator>> chunk_arr;
+	std::mutex chunk_mtx;
+
+	static inline mt_mempool* inst = nullptr;
+	static inline mempool_util::pointer_mutex* ptr_mtx;
 
 	mt_mempool() {
-
+		assert(inst == nullptr);
+		inst = this;
+		ptr_mtx = &mempool_util::get_pointer_mutex();
+		
 		if (chunk_arr.empty()) {
 			chunk_arr.emplace_back(std::make_unique<allocator>());
 		}
 	}
-
+	~mt_mempool() {
+		if(inst == this)
+			inst = nullptr;
+	}
 
 	template<typename t>
-	std::unique_ptr<t*,inst_deleter<t>> construct() {
+	std::unique_ptr<t*,inst_deleter> construct() {
 
 		for (auto& chunk : chunk_arr)
 		{
 			if (chunk->allocateable<t>()) {
 
-				return std::unique_ptr<t*, inst_deleter<t>>(
-					chunk->construct<t>(),
-					inst_deleter<t>(chunk.get())
+				return std::unique_ptr<t*, inst_deleter>(
+					chunk->construct<t>()
 				);
 			}
 		}
+		allocator* owner;
 
+		{
+			std::lock_guard lock(chunk_mtx);
+			owner = chunk_arr.emplace_back(std::make_unique<allocator>()).get();
+		}
 
-		allocator* owner = chunk_arr.emplace_back(std::make_unique<allocator>()).get();
-
-		return std::unique_ptr<t*, inst_deleter<t>>(
-			owner->back_ind_lock_construct<t>(),
-			inst_deleter<t>(owner)
+		return std::unique_ptr<t*, inst_deleter>(
+			owner->back_ind_lock_construct<t>()
 		);
+	}
+
+	void gc() {
+		decltype(chunk_arr.begin()) itr;
+		decltype(chunk_arr.begin()) end;
+
+		{
+			std::lock_guard lock(chunk_mtx);
+			itr = chunk_arr.begin();
+			end = chunk_arr.end();
+		}
+		
+		for (; itr != end; ++itr)
+		{
+			(*itr)->gc();
+		}
 	}
 };
 
@@ -506,11 +521,11 @@ struct accessor {
 		return *(t*)((mt_mempool::inst_info*)info)->ptr;
 	}
 
-	void lock(const std::unique_ptr<t*,mt_mempool::inst_deleter<t>>& ptr) {
+	void lock(const std::unique_ptr<t*,mt_mempool::inst_deleter>& ptr) {
 		mtx.lock(ptr.get());
 	}
 
-	void unlock(const std::unique_ptr<t*, mt_mempool::inst_deleter<t>>& ptr) {
+	void unlock(const std::unique_ptr<t*, mt_mempool::inst_deleter>& ptr) {
 		mtx.unlock(ptr.get());
 	}
 };

@@ -360,13 +360,12 @@ struct test_object {
 // タイマー
 // ------------------------------------------------------------
 
-class scoped_timer {
+struct scoped_timer {
     using clock = std::chrono::high_resolution_clock;
 
     std::string _name;
     clock::time_point _begin;
 
-public:
     scoped_timer(std::string name)
         : _name(std::move(name)), _begin(clock::now()) {
     }
@@ -704,14 +703,26 @@ void benchmark_mt_mempool(
 
     mt_mempool pool;
 
+    bool finish = false;
+
+    std::thread gc_thread([&]
+        {
+            while (!finish)
+            {
+                pool.gc();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+
     accessor<test_object> acc;
+
 
     //--------------------------------------------
     // construct + destruct
     //--------------------------------------------
     {
         scoped_timer timer("construct + destruct");
-
         for (size_t loop = 0; loop < loop_count; loop++)
         {
             std::vector<decltype(pool.construct<test_object>())> ptrs;
@@ -721,13 +732,9 @@ void benchmark_mt_mempool(
             {
                 ptrs.emplace_back(pool.construct<test_object>());
             }
-     
             ptrs.clear();
-
-            for (auto& chunk : pool.chunk_arr)
-                chunk->gc();
-
         }
+
     }
 
 
@@ -746,23 +753,21 @@ void benchmark_mt_mempool(
         }
     }
 
-    for (auto& chunk : pool.chunk_arr)
-        chunk->gc();
 
     //--------------------------------------------
     // GC
     //--------------------------------------------
-    {
-        std::vector<decltype(pool.construct<test_object>())> ptrs;
-
-        for (size_t i = 0; i < object_count; i++)
-            ptrs.emplace_back(pool.construct<test_object>());
-
-        scoped_timer timer("gc");
-
-        for (auto& chunk : pool.chunk_arr)
-            chunk->gc();
-    }
+    //{
+    //    std::vector<decltype(pool.construct<test_object>())> ptrs;
+    //
+    //    for (size_t i = 0; i < object_count; i++)
+    //        ptrs.emplace_back(pool.construct<test_object>());
+    //
+    //    scoped_timer timer("gc");
+    //
+    //    for (auto& chunk : pool.chunk_arr)
+    //        chunk->gc();
+    //}
 
 
     //--------------------------------------------
@@ -798,6 +803,10 @@ void benchmark_mt_mempool(
         << "estimated raw memory : "
         << estimate_memory_usage<int>(object_count)
         << " bytes\n";
+
+    finish = true;
+
+    gc_thread.join();
 }
 
 void benchmark_mt_gc_parallel(
@@ -825,8 +834,6 @@ void benchmark_mt_gc_parallel(
 
     std::thread gc([&]
         {
-            mempool_util::pointer_mutex::init_thread();
-
             while (!finish)
             {
                 for (auto& chunk : pool.chunk_arr)
@@ -892,8 +899,6 @@ namespace mt_mem {
         //----------------------------------------------------------
         std::thread gc_thread([&]
             {
-                mempool_util::pointer_mutex::init_thread();
-
                 while (!finish)
                 {
                     for (auto& chunk : pool.chunk_arr)
@@ -910,8 +915,6 @@ namespace mt_mem {
         {
             for (size_t i = 0; i < object_count; i++)
             {
-                //const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
-                //const std::unique_ptr<accessor::t,mt_mempool::inst_deleter<mt_mempool::t>> &
                 acc.lock(objs[i]);
 
                 int& value = acc(objs[i].get());
@@ -1044,9 +1047,6 @@ namespace mt_mem {
 }
 int main() {
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
-
-
-    mempool_util::pointer_mutex::init_thread();
     test_pool();
     mt_mem::test_main();
 
